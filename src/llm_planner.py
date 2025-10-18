@@ -103,13 +103,27 @@ if LANGCHAIN_OK:
     _PROMPT = PromptTemplate(
         input_variables=["snapshot"],
         template=(
-            "You are a delivery planner. Given this compact snapshot of the world, return exactly valid JSON with keys:\n"
-            " - plan: a list of steps where each step has pickup [col,row], dropoff [col,row], weight (float)\n"
-            " - confidence: float 0..1\n"
-            " - narration: a short (1-3 sentence) explanation of why this plan is efficient for maximizing deliveries given battery constraints.\n"
-            "Return JSON only.\n\nSnapshot:\n{snapshot}\n\nObjective: maximize successful deliveries within remaining time while avoiding lost drones."
+            "You are a delivery planner operating with the following deterministic energy model:\n"
+            " - To travel N cell-units costs: energy = N * base_cost_per_cell * (1 + weight * weight_factor)\n"
+            " - Picking or dropping a parcel costs pick_drop_cost*(1 + weight*weight_factor)\n"
+            " - Distances: use euclidean cell distances provided in snapshot (or compute euclidean if needed).\n\n"
+
+            "You will be given exactly one variable: {snapshot}\n\n"
+
+            "Return valid JSON only, with keys:\n"
+            "  - plan: a list of step objects in execution order. Each step must be {\"pickup\":[col,row], \"dropoff\":[col,row], \"weight\":float}\n"
+            "  - confidence: float between 0.0 and 1.0 indicating how confident you are the plan respects energy constraints\n"
+            "  - narration: 1-4 short sentences explaining why the plan is efficient and any risky assumptions (if any)\n\n"
+
+            "Rules:\n"
+            "  - Compute energy required for each leg using the energy_model constants in the snapshot.\n"
+            "  - If a planned leg requires more energy than the agent's battery_level, mark it as risky and include that information in narration.\n"
+            "  - Prefer pickups with lower total estimated cost first, and prefer delivering to free station cells (snapshot includes station center and per-parcel estimates).\n"
+            "  - Do NOT output any other keys or extra text. Only output JSON.\n\n"
+            "Objective: maximize number of completed deliveries while minimizing the chance of the drone becoming lost."
         )
     )
+
     _CHAIN = LLMChain(llm=_LLM, prompt=_PROMPT)
 
 
@@ -154,7 +168,9 @@ def _call_llm_for_plan(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
 class PlannerClient:
     """
+
     Planner that returns a dict with keys plan, confidence, narration.
+
     """
     def __init__(self, use_llm: bool = False):
         self.use_llm = use_llm and LANGCHAIN_OK

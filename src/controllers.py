@@ -123,25 +123,104 @@ class AIAgentController(BaseAgentController):
     # Planner interaction
     # ---------------------------
     def _make_snapshot(self) -> Dict:
-        """Create a compact snapshot of the world state for the planner input."""
+        """
+        Create a compact snapshot of the world state for the planner input.
+
+        This snapshot includes:
+          - agent location and battery_pct
+          - carrying info (has, weight)
+          - nearest station (col,row,w,h)
+          - all parcels (col,row,weight,picked,delivered)
+          - energy model constants so the LLM can compute estimated energy costs exactly
+          - grid info (cols/rows) and an optional precomputed estimate for each parcel:
+              - dist_agent: euclidean cell distance from agent to parcel
+              - dist_to_station: euclidean cell distance from parcel to nearest station center
+              - est_energy_to_pick_and_deliver: estimated energy units for agent->pickup + pickup->station (uses same formula as Drone.energy_needed_for_cells)
+        """
         snap = {
-            "agent": {"col": int(self.drone.col), "row": int(self.drone.row),
-                      "battery_pct": int(self.drone.power.percent()) if hasattr(self.drone, "power") else 0},
-            "carrying": {"has": bool(self.drone.carrying),
-                         "weight": getattr(self.drone.carrying, "weight", 0.0) if self.drone.carrying else 0.0},
+            "agent": {
+                "col": int(self.drone.col),
+                "row": int(self.drone.row),
+                "battery_pct": int(self.drone.power.percent()) if hasattr(self.drone, "power") else 0,
+                # also include raw power level (energy units) if available
+                "battery_level": float(self.drone.power.level) if hasattr(self.drone, "power") else None,
+            },
+            "carrying": {
+                "has": bool(self.drone.carrying),
+                "weight": getattr(self.drone.carrying, "weight", 0.0) if self.drone.carrying else 0.0
+            },
             "nearest_station": None,
             "all_parcels": [],
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            # energy model exposed so planner and LLM use the same numbers:
+            "energy_model": {
+                "base_cost_per_cell": float(getattr(self.drone, "BASE_COST_PER_CELL", 0.2)),
+                "weight_factor": float(getattr(self.drone, "WEIGHT_FACTOR", 0.5)),
+                "pick_drop_cost": float(getattr(self.drone, "PICK_DROP_COST", 0.7)),
+                "allow_diagonal": bool(getattr(self.drone, "allow_diagonal", True))
+            },
+            # grid info helpful for distance reasoning
+            "grid": {
+                "grid_size": int(self.terrain.grid_size),
+                "cols": int(self.terrain.screen_size[0] // self.terrain.grid_size),
+                "rows": int(self.terrain.screen_size[1] // self.terrain.grid_size),
+            }
         }
+
+        # nearest station as before
         station = self.terrain.nearest_station(self.drone.col, self.drone.row)
         if station:
-            snap["nearest_station"] = {"col": station.col, "row": station.row, "w": station.w, "h": station.h}
+            snap["nearest_station"] = {"col": int(station.col), "row": int(station.row),
+                                       "w": int(station.w), "h": int(station.h),
+                                       # center cell used by controllers as "home"
+                                       "center": (int(station.col + station.w // 2), int(station.row + station.h // 2))
+                                       }
 
+        # helper to compute euclidean distance in cell units
+        def _euclid_cell_dist(a_col, a_row, b_col, b_row):
+            dx = float(b_col - a_col)
+            dy = float(b_row - a_row)
+            return (dx * dx + dy * dy) ** 0.5
+
+        # exposed energy calc helper (same formula as Drone.energy_needed_for_cells)
+        base = snap["energy_model"]["base_cost_per_cell"]
+        wfactor = snap["energy_model"]["weight_factor"]
+
+        def est_energy_for_cells(n_cells, weight):
+            return float(n_cells) * base * (1.0 + weight * wfactor)
+
+        # For each parcel, include estimates so LLM doesn't have to guess mapping battery%->energy
         for p in self.terrain.parcels:
-            snap["all_parcels"].append({
-                "col": p.col, "row": p.row, "weight": getattr(p, "weight", 1.0),
-                "picked": getattr(p, "picked", False), "delivered": getattr(p, "delivered", False)
-            })
+            parcel_info = {
+                "col": int(p.col),
+                "row": int(p.row),
+                "weight": float(getattr(p, "weight", 1.0)),
+                "picked": bool(getattr(p, "picked", False)),
+                "delivered": bool(getattr(p, "delivered", False))
+            }
+
+            # compute distances & rough energy numbers (agent->pickup, pickup->nearest_station_center)
+            adist = _euclid_cell_dist(self.drone.col, self.drone.row, p.col, p.row)
+            parcel_info["dist_agent_cells_euclidean"] = round(adist, 3)
+
+            if station:
+                sc = int(station.col + station.w // 2)
+                sr = int(station.row + station.h // 2)
+                sdist = _euclid_cell_dist(p.col, p.row, sc, sr)
+                parcel_info["dist_to_station_cells_euclidean"] = round(sdist, 3)
+                # estimated energy to go agent->pickup (empty) then pickup->station (carrying)
+                est = est_energy_for_cells(adist, 0.0) + est_energy_for_cells(sdist, parcel_info["weight"])
+                parcel_info["est_energy_agent_pickup_and_deliver_to_station"] = round(est, 3)
+            else:
+                parcel_info["dist_to_station_cells_euclidean"] = None
+                parcel_info["est_energy_agent_pickup_and_deliver_to_station"] = None
+
+            # add a simpler conservative manhattan estimate (useful if prompt asks for it)
+            md = abs(int(self.drone.col) - int(p.col)) + abs(int(self.drone.row) - int(p.row))
+            parcel_info["dist_agent_cells_manhattan"] = int(md)
+
+            snap["all_parcels"].append(parcel_info)
+
         return snap
 
     def _request_plan(self, force_refresh: bool = False):
