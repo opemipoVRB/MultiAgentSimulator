@@ -5,6 +5,9 @@ name = "pypi"
 
 [packages]
 pygame-ce = "*"
+langchain = "*"
+langchain-openai = "*"
+langgraph = "*"
 
 [dev-packages]
 
