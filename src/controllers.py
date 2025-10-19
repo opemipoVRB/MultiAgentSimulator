@@ -2,6 +2,7 @@
 import pygame
 import random
 import time
+import math
 from typing import Optional, Tuple, List, Dict
 
 from llm_planner import PlannerClient
@@ -101,9 +102,12 @@ class AIAgentController(BaseAgentController):
       - Periodically requests replans.
       - Revalidates pickups/dropoffs, checks battery feasibility for the *immediate* leg
         (if ALLOW_RISKY_TRIPS=True it will NOT require return-to-base energy).
-      - Ensures immediate pickup/drop is attempted as soon as the drone reaches the cell
-        (fixes the "fly-by" without picking issue).
+      - Ensures immediate pickup/drop is attempted as soon as the drone reaches the cell.
       - Prefers free cells inside nearest station and avoids repeating the same station cell when possible.
+
+    CHANGE: When planner returns no plan, controller will fall back to a simple local behavior:
+      - If there are undelivered parcels in the field, pick the nearest parcel and head there.
+      - `fallback_active` and `fallback_target` expose that state for HUD/debugging.
     """
     def __init__(self, drone, terrain, search_radius: Optional[int] = None, replanning_interval: float = 4.0):
         super().__init__(drone, terrain)
@@ -119,30 +123,33 @@ class AIAgentController(BaseAgentController):
         # used to bias away from repeating the very last chosen drop cell
         self._last_chosen_drop: Optional[Tuple[int, int]] = None
 
+        # Fallback state exposed for HUD and debugging
+        self.fallback_active: bool = False
+        self.fallback_target: Optional[Tuple[int, int]] = None
+
+    # -------------
+    # Helpers
+    # -------------
+    def _field_parcels_remaining(self) -> bool:
+        """Return True if any parcel in the terrain is not delivered (still in the field)."""
+        for p in self.terrain.parcels:
+            # treat undelivered parcels in the world as "in the field". Picked parcels are not in the field.
+            if not getattr(p, "delivered", False) and not getattr(p, "picked", False):
+                return True
+        return False
+
     # ---------------------------
     # Planner interaction
     # ---------------------------
     def _make_snapshot(self) -> Dict:
         """
         Create a compact snapshot of the world state for the planner input.
-
-        This snapshot includes:
-          - agent location and battery_pct
-          - carrying info (has, weight)
-          - nearest station (col,row,w,h)
-          - all parcels (col,row,weight,picked,delivered)
-          - energy model constants so the LLM can compute estimated energy costs exactly
-          - grid info (cols/rows) and an optional precomputed estimate for each parcel:
-              - dist_agent: euclidean cell distance from agent to parcel
-              - dist_to_station: euclidean cell distance from parcel to nearest station center
-              - est_energy_to_pick_and_deliver: estimated energy units for agent->pickup + pickup->station (uses same formula as Drone.energy_needed_for_cells)
         """
         snap = {
             "agent": {
                 "col": int(self.drone.col),
                 "row": int(self.drone.row),
                 "battery_pct": int(self.drone.power.percent()) if hasattr(self.drone, "power") else 0,
-                # also include raw power level (energy units) if available
                 "battery_level": float(self.drone.power.level) if hasattr(self.drone, "power") else None,
             },
             "carrying": {
@@ -152,14 +159,12 @@ class AIAgentController(BaseAgentController):
             "nearest_station": None,
             "all_parcels": [],
             "timestamp": time.time(),
-            # energy model exposed so planner and LLM use the same numbers:
             "energy_model": {
                 "base_cost_per_cell": float(getattr(self.drone, "BASE_COST_PER_CELL", 0.2)),
                 "weight_factor": float(getattr(self.drone, "WEIGHT_FACTOR", 0.5)),
                 "pick_drop_cost": float(getattr(self.drone, "PICK_DROP_COST", 0.7)),
                 "allow_diagonal": bool(getattr(self.drone, "allow_diagonal", True))
             },
-            # grid info helpful for distance reasoning
             "grid": {
                 "grid_size": int(self.terrain.grid_size),
                 "cols": int(self.terrain.screen_size[0] // self.terrain.grid_size),
@@ -172,7 +177,6 @@ class AIAgentController(BaseAgentController):
         if station:
             snap["nearest_station"] = {"col": int(station.col), "row": int(station.row),
                                        "w": int(station.w), "h": int(station.h),
-                                       # center cell used by controllers as "home"
                                        "center": (int(station.col + station.w // 2), int(station.row + station.h // 2))
                                        }
 
@@ -182,7 +186,6 @@ class AIAgentController(BaseAgentController):
             dy = float(b_row - a_row)
             return (dx * dx + dy * dy) ** 0.5
 
-        # exposed energy calc helper (same formula as Drone.energy_needed_for_cells)
         base = snap["energy_model"]["base_cost_per_cell"]
         wfactor = snap["energy_model"]["weight_factor"]
 
@@ -199,7 +202,6 @@ class AIAgentController(BaseAgentController):
                 "delivered": bool(getattr(p, "delivered", False))
             }
 
-            # compute distances & rough energy numbers (agent->pickup, pickup->nearest_station_center)
             adist = _euclid_cell_dist(self.drone.col, self.drone.row, p.col, p.row)
             parcel_info["dist_agent_cells_euclidean"] = round(adist, 3)
 
@@ -208,14 +210,12 @@ class AIAgentController(BaseAgentController):
                 sr = int(station.row + station.h // 2)
                 sdist = _euclid_cell_dist(p.col, p.row, sc, sr)
                 parcel_info["dist_to_station_cells_euclidean"] = round(sdist, 3)
-                # estimated energy to go agent->pickup (empty) then pickup->station (carrying)
                 est = est_energy_for_cells(adist, 0.0) + est_energy_for_cells(sdist, parcel_info["weight"])
                 parcel_info["est_energy_agent_pickup_and_deliver_to_station"] = round(est, 3)
             else:
                 parcel_info["dist_to_station_cells_euclidean"] = None
                 parcel_info["est_energy_agent_pickup_and_deliver_to_station"] = None
 
-            # add a simpler conservative manhattan estimate (useful if prompt asks for it)
             md = abs(int(self.drone.col) - int(p.col)) + abs(int(self.drone.row) - int(p.row))
             parcel_info["dist_agent_cells_manhattan"] = int(md)
 
@@ -260,7 +260,6 @@ class AIAgentController(BaseAgentController):
             truncated = truncated[:297].rstrip() + "..."
         self.last_narration = truncated
 
-        # debug log so you can inspect planner decisions
         try:
             print("[PLANNER] plan received:", self.plan)
             print("[PLANNER] narration:", self.last_narration)
@@ -288,15 +287,17 @@ class AIAgentController(BaseAgentController):
         """
         Conservative energy check for the leg from_cell -> to_cell.
         If require_return=True it also checks ability to return home (not used when ALLOW_RISKY_TRIPS=True).
-        When ALLOW_RISKY_TRIPS is True, require_return should be False for immediate legs.
+        When ALLOW_RISKY_TRIPS is True, the controller will allow immediate legs (bypass check).
         """
-        # distance in cells (Manhattan) is conservative; Drone may use diagonal movement when moving.
-        dist = abs(from_cell[0] - to_cell[0]) + abs(from_cell[1] - to_cell[1])
+        # If risky mode and only checking immediate leg, allow the trip unconditionally.
+        if ALLOW_RISKY_TRIPS and not require_return:
+            return True
 
+        # conservative Manhattan estimate for energy needed (controller-side)
+        dist = abs(from_cell[0] - to_cell[0]) + abs(from_cell[1] - to_cell[1])
         needed = self.drone.energy_needed_for_cells(dist, carry_weight)
 
         if require_return:
-            # determine nearest station as "home" for return calculation
             station = self.terrain.nearest_station(from_cell[0], from_cell[1])
             if station:
                 home_col = int(station.col + station.w // 2)
@@ -304,22 +305,12 @@ class AIAgentController(BaseAgentController):
                 dist_back = abs(to_cell[0] - home_col) + abs(to_cell[1] - home_row)
                 needed += self.drone.energy_needed_for_cells(dist_back, 0.0)
 
-        # If we allow risky trips, don't force a margin for return; just require energy >= needed (no extra margin).
-        # If you want some margin, add a small constant here.
         return (self.drone.power.level >= needed)
 
     # ---------------------------
     # Delivery cell chooser
     # ---------------------------
     def _choose_delivery_cell(self) -> Tuple[int, int]:
-        """
-        Choose a delivery cell. Preference order:
-         1. least-used free cell inside nearest station (if any)
-         2. other free station cell avoiding repeating the last chosen
-         3. random free cell on map avoiding last chosen if possible
-         4. fallback to current drone cell
-        Stores chosen into self._last_chosen_drop for biasing future choices.
-        """
         station = self.terrain.nearest_station(self.drone.col, self.drone.row)
 
         def _set_and_return(cell: Tuple[int, int]) -> Tuple[int, int]:
@@ -327,7 +318,6 @@ class AIAgentController(BaseAgentController):
             return cell
 
         if station:
-            # prefer least-used free cell (station helper provided in artifacts if implemented)
             try:
                 least_used = station.least_used_free_cell(self.terrain)
             except Exception:
@@ -336,7 +326,6 @@ class AIAgentController(BaseAgentController):
             if least_used:
                 return _set_and_return(least_used)
 
-            # otherwise pick a free cell but avoid repeating last chosen if possible
             cells = [(c, r) for r in range(station.row, station.row + station.h)
                      for c in range(station.col, station.col + station.w)]
             free_cells = [c for c in cells if not self.terrain.occupied_cell(c[0], c[1])]
@@ -346,13 +335,11 @@ class AIAgentController(BaseAgentController):
                     choices = free_cells
                 return _set_and_return(random.choice(choices))
 
-            # no free cells -> pick some station cell avoiding repeats
             choices = [c for c in cells if c != self._last_chosen_drop]
             if choices:
                 return _set_and_return(random.choice(choices))
             return _set_and_return(random.choice(cells))
 
-        # No station present: sample free cells on the map
         cols = self.terrain.screen_size[0] // self.terrain.grid_size
         rows = self.terrain.screen_size[1] // self.terrain.grid_size
         attempts = 0
@@ -369,7 +356,6 @@ class AIAgentController(BaseAgentController):
             if not self.terrain.occupied_cell(c, r) and (c, r) != self._last_chosen_drop:
                 chosen = (c, r)
                 break
-            # relax after many attempts
             if attempts > 50 and not self.terrain.occupied_cell(c, r):
                 chosen = (c, r)
                 break
@@ -387,73 +373,67 @@ class AIAgentController(BaseAgentController):
         if self.cooldown > 0:
             self.cooldown -= dt
 
+        # reset fallback indicators at start of tick; set True only if we go into fallback branch
+        self.fallback_active = False
+        self.fallback_target = None
+
         if self.drone.lost:
             return
 
         now = time.time()
 
-        # --- IMPORTANT: If drone is not moving, attempt immediate pick/drop BEFORE any planning decisions.
-        # This ensures a drone that just arrived on a parcel cell actually performs the pick,
-        # and a drone that is carrying and on a valid drop cell performs the drop.
+        # Immediate pick/drop when not moving
         if not self.drone.moving:
             # If not carrying, attempt local pickup if there is a parcel here
             if self.drone.carrying is None:
                 p_here = self.terrain.parcel_at_cell(self.drone.col, self.drone.row)
                 if p_here:
-                    # attempt pick immediately
                     print(f"[AI] arrived at parcel cell {(self.drone.col, self.drone.row)} - attempting pick (battery={int(self.drone.power.percent())}%)")
                     success = self.drone.perform_pick(p_here)
                     if not success:
-                        # pick failed; mark UI flash via last_action is handled by perform_pick (returns False on lost)
                         self.drone._last_action = ("pick_failed", (self.drone.col, self.drone.row), None)
-                        # consider returning to station if possible
+                        # consider returning to station only when there are NO field parcels remaining
                         station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-                        if station:
+                        if station and not self._field_parcels_remaining():
                             home = (station.col + station.w // 2, station.row + station.h // 2)
                             self.drone.set_target_cell(*home)
                             self.state = "returning"
                         return
                     else:
-                        # picked successfully; set controller state and exit so carrying branch handles drop next frame
                         self.state = "carrying"
                         self._last_action_time = now
                         return
 
             # If carrying, attempt immediate drop if we are on a station / drop cell and cell is free
             else:
-                # if cell is within a station (or could be any free cell), drop now
                 station = self.terrain.nearest_station(self.drone.col, self.drone.row)
                 if station and station.contains_cell(self.drone.col, self.drone.row):
-                    # only drop if cell is not occupied by another undelivered parcel
                     if not self.terrain.occupied_cell(self.drone.col, self.drone.row):
                         print(f"[AI] arrived at station cell {(self.drone.col, self.drone.row)} - attempting drop (battery={int(self.drone.power.percent())}%)")
                         parcel_ref = self.drone.carrying
                         self.drone.perform_drop(parcel_ref)
-                        # record last chosen drop so chooser avoids repeats
                         self._last_chosen_drop = (self.drone.col, self.drone.row)
-                        # advance plan if this was expected drop
                         step = self._current_step()
                         if step and tuple(step["dropoff"]) == (self.drone.col, self.drone.row):
                             self._advance_plan()
                         return
-                # else: not in station or occupied -> don't force drop; let normal logic decide
 
-        # ---- If we reach here we are either moving OR not moving but there's nothing to immediately pick/drop.
-        # Now handle planning & navigation logic (request plan, follow plan, energy checks, etc.)
-
-        # request plan if none or time to replan
+        # Request a plan if needed
         time_to_replan = (now - self._last_plan_time) > self._replanning_interval
         if (not self.plan) or time_to_replan:
             self._request_plan(force_refresh=False)
 
-        # if drone currently moving wait for arrival (note: arrival frame above handles pick/drop)
+        # If drone currently moving wait for arrival (arrival handles pick/drop)
         if self.drone.moving:
             return
 
-        # ---------- carrying branch: aim to drop according to plan ----------
+        # ---------- carrying branch ----------
         if self.drone.carrying:
+            # clear fallback when following plan
+            self.fallback_active = False
+            self.fallback_target = None
+
             step = self._current_step()
-            # deduce planned dropoff: prefer plan, else nearest station center or chooser
             if step:
                 planned_drop = tuple(step["dropoff"])
             else:
@@ -470,7 +450,6 @@ class AIAgentController(BaseAgentController):
                 else:
                     planned_drop = (self.drone.col, self.drone.row)
 
-            # If planned_drop is occupied or equals the last chosen drop, try alternatives
             if self.terrain.occupied_cell(planned_drop[0], planned_drop[1]) or \
                     (self._last_chosen_drop is not None and planned_drop == self._last_chosen_drop):
                 station_for_drop = self.terrain.nearest_station(planned_drop[0], planned_drop[1])
@@ -486,8 +465,6 @@ class AIAgentController(BaseAgentController):
                 else:
                     planned_drop = self._choose_delivery_cell()
 
-            # energy check: can we reach planned_drop while carrying?
-            # When ALLOW_RISKY_TRIPS=True we only require energy to reach planned_drop (not to return)
             enough = self._ensure_energy_for_route(
                 (self.drone.col, self.drone.row),
                 planned_drop,
@@ -496,63 +473,92 @@ class AIAgentController(BaseAgentController):
             )
 
             if not enough:
+                # Only auto-return to station if there are NO undelivered field parcels left.
                 if not ALLOW_RISKY_TRIPS:
                     station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-                    if station:
+                    if station and not self._field_parcels_remaining():
                         home = (station.col + station.w // 2, station.row + station.h // 2)
                         self.drone.set_target_cell(*home)
                         self.state = "returning"
                         return
                     else:
-                        self.drone.lost = True
-                        return
+                        if self._field_parcels_remaining():
+                            if ALLOW_RISKY_TRIPS:
+                                if not self.drone.moving:
+                                    print(f"[PLANNER] attempting risky drop to {planned_drop} battery={int(self.drone.power.percent())}%")
+                                    self.drone.set_target_cell(planned_drop[0], planned_drop[1])
+                                return
+                            else:
+                                self._request_plan(force_refresh=True)
+                                return
                 else:
-                    # ALLOW_RISKY_TRIPS -> attempt the trip anyway (drone may die en-route)
                     if not self.drone.moving:
                         print(f"[PLANNER] attempting risky drop to {planned_drop} battery={int(self.drone.power.percent())}%")
                         self.drone.set_target_cell(planned_drop[0], planned_drop[1])
                     return
 
-            # if at planned drop cell, drop (if still free)
+            # at planned drop cell?
             if (self.drone.col, self.drone.row) == planned_drop:
                 if not self.terrain.occupied_cell(planned_drop[0], planned_drop[1]):
                     parcel_ref = self.drone.carrying
                     self.drone.perform_drop(parcel_ref)
-                    # record chosen drop to bias away in future
                     self._last_chosen_drop = planned_drop
-                    # station accounting (station.register_delivery) handled by game loop when receiving last_action
                     if step and tuple(step["dropoff"]) == planned_drop:
                         self._advance_plan()
                     return
                 else:
-                    # occupied unexpectedly, replan
                     self._request_plan(force_refresh=True)
                     return
 
-            # otherwise, set target to planned_drop
+            # otherwise set target
             if not self.drone.moving:
                 self.drone.set_target_cell(planned_drop[0], planned_drop[1])
             return
 
-        # ---------- not carrying branch: attempt pickup steps ----------
+        # ---------- not carrying branch ----------
         step = self._current_step()
+
+        # If planner gave no step, but parcels remain in the field, head to the nearest parcel (fallback).
         if not step:
+            if self._field_parcels_remaining():
+                best = None
+                best_d = None
+                for p in self.terrain.parcels:
+                    if getattr(p, "delivered", False) or getattr(p, "picked", False):
+                        continue
+                    dx = (p.col - self.drone.col)
+                    dy = (p.row - self.drone.row)
+                    d = math.hypot(dx, dy)
+                    if best is None or d < best_d:
+                        best = p
+                        best_d = d
+
+                if best:
+                    # set fallback state for HUD
+                    self.fallback_active = True
+                    self.fallback_target = (best.col, best.row)
+
+                    # go get it (ALLOW_RISKY_TRIPS bypasses conservative blocking)
+                    if not self.drone.moving:
+                        print(f"[AI] no plan returned but field parcels remain -> heading to nearest parcel at ({best.col},{best.row}) battery={int(self.drone.power.percent())}%")
+                        self.drone.set_target_cell(best.col, best.row)
+                        self.state = "seeking"
+                    return
+
+            # truly idle (no plan and no parcels)
             self.state = "idle"
             return
 
+        # If pickup planned, validate parcel still there
         pickup = tuple(step["pickup"])
-        # verify pickup still available (not picked, not delivered)
         pobj = self.terrain.parcel_at_cell(pickup[0], pickup[1])
         if pobj is None or getattr(pobj, "delivered", False):
-            # advance plan and consider replanning
             self._advance_plan()
             if (now - self._last_plan_time) > self._replanning_interval:
                 self._request_plan(force_refresh=True)
             return
 
         dropoff = tuple(step["dropoff"])
-        # energy checks: current->pickup then pickup->dropoff (with weight)
-        # NOTE: when ALLOW_RISKY_TRIPS=True we do not require enough energy to also return home.
         can_reach_pick = self._ensure_energy_for_route((self.drone.col, self.drone.row), pickup,
                                                        carry_weight=0.0,
                                                        require_return=False)
@@ -560,15 +566,13 @@ class AIAgentController(BaseAgentController):
                                                              carry_weight=step.get("weight", 1.0),
                                                              require_return=(not ALLOW_RISKY_TRIPS))
         if not (can_reach_pick and can_reach_after_pick):
-            # if conservative mode, return to station to recharge if possible
             station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-            if station and not ALLOW_RISKY_TRIPS:
+            if station and not ALLOW_RISKY_TRIPS and not self._field_parcels_remaining():
                 home = (station.col + station.w // 2, station.row + station.h // 2)
                 self.drone.set_target_cell(*home)
                 self.state = "returning"
                 return
             else:
-                # either replan or attempt risky pickup
                 if ALLOW_RISKY_TRIPS:
                     if not self.drone.moving:
                         print(f"[PLANNER] attempting risky pickup at {pickup} battery={int(self.drone.power.percent())}%")
@@ -578,18 +582,16 @@ class AIAgentController(BaseAgentController):
                     self._request_plan(force_refresh=True)
                     return
 
-        # if at pickup cell -> pick using drone.perform_pick (should be handled above already but keep as fallback)
+        # if at pickup cell -> pick
         if (self.drone.col, self.drone.row) == pickup:
             success = self.drone.perform_pick(pobj)
             if success:
-                # picked, now the carrying branch will run next frame
                 self.state = "carrying"
                 self._last_action_time = now
                 return
             else:
-                # pick failed (low battery) -> return home if possible
                 station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-                if station:
+                if station and not self._field_parcels_remaining():
                     home = (station.col + station.w // 2, station.row + station.h // 2)
                     self.drone.set_target_cell(*home)
                     return
@@ -599,11 +601,10 @@ class AIAgentController(BaseAgentController):
 
         # otherwise set target to pickup
         if not self.drone.moving:
-            # validate target parcel hasn't been taken
             if pobj.picked or getattr(pobj, "delivered", False):
-                # someone else took it; advance next loop
                 self._advance_plan()
                 return
+            # no fallback in this branch (we follow the plan)
             self.drone.set_target_cell(pickup[0], pickup[1])
             self.state = "seeking"
             return

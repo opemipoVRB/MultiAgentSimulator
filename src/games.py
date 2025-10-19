@@ -221,6 +221,10 @@ def run_game(initial_parcels):
     ai = AIAgentController(drone, terrain)
     switcher = ControllerSwitcher([human, ai])
 
+    # *** Make AI the default controller at startup so simulation uses AI behavior immediately. ***
+    # If you prefer Human-first, remove or change the next line.
+    switcher.index = 1
+
     font_local = pygame.font.SysFont("Consolas", 20)
     narration_font = pygame.font.SysFont("Consolas", 22)
 

@@ -1,12 +1,11 @@
 # src/artifacts.py
 
-
 import random
 import math
 import heapq
-from typing import List, Tuple, Optional, Iterable
+from typing import List, Tuple, Optional, Iterable, Dict
 
-from collections import defaultdict, deque
+from collections import defaultdict
 import pygame
 
 
@@ -69,7 +68,6 @@ class Parcel:
         self.weight = float(weight)
 
     def draw(self, surf, parcel_img=None, parcel_scale=0.7):
-        # Always draw delivered parcels, but visually distinct (they are not pickable)
         if self.delivered:
             if parcel_img:
                 img = parcel_img.copy()
@@ -83,7 +81,6 @@ class Parcel:
                 pygame.draw.rect(surf, (100, 100, 100), rect, 2)
             return
 
-        # do not draw picked parcels (they are carried by drone)
         if self.picked:
             return
 
@@ -100,16 +97,11 @@ class Drone:
     """
     Drone supporting 8-neighbour A* planning (energy-aware) but moving in smooth
     Euclidean straight-line motion to the chosen world-space target when allow_direct=True.
-
-    - A* used to compute energy-aware path when allow_direct=False (or obstacles added later).
-    - Direct mode: drone moves straight to final cell center, producing smooth diagonals.
-    - Energy accounting is based on Euclidean distance moved (cells = pixels / grid_size).
     """
 
-    # energy cost constants (tuneable)
-    BASE_COST_PER_CELL = 0.2      # energy units per cell travelled (empty)
-    WEIGHT_FACTOR = 0.5           # additional factor per unit weight when carrying
-    PICK_DROP_COST = 0.7          # energy units for a pick/drop (base) multiplied by weight factor
+    BASE_COST_PER_CELL = 0.4
+    WEIGHT_FACTOR = 1.5
+    PICK_DROP_COST = 0.7
 
     def __init__(self,
                  start_cell: Tuple[int, int],
@@ -132,40 +124,28 @@ class Drone:
         self.pos = pygame.Vector2(self.col * grid_size + grid_size / 2,
                                   self.row * grid_size + grid_size / 2)
 
-        # world-space movement
-        self.target: Optional[pygame.Vector2] = None   # current world-space target (center of a cell)
+        self.target: Optional[pygame.Vector2] = None
         self.moving = False
-
-        # carried parcel
-        self.carrying = None  # Parcel reference
-
-        # animation
+        self.carrying = None
         self.anim_t = 0.0
         self.anim_frame = 0
-
-        # last action for UI
         self._last_action = None
 
-        # resources (PowerResource and NetworkResource must exist in file)
         self.power = PowerResource(capacity=battery_capacity)
         self.network = NetworkResource(capacity=100.0)
-
-        # lost flag when battery drained
         self.lost = False
+        self.at_station = True
 
-        # path / planning storage (adjacent cells)
         self.path: List[Tuple[int, int]] = []
         self._path_step_idx = 0
 
-        # behavior flags
         self.allow_diagonal = bool(allow_diagonal)
         self.allow_direct = bool(allow_direct)
 
     # -------------------------
-    # A* (energy-aware) helpers
+    # A* helpers
     # -------------------------
     def _neighbours(self, c: int, r: int) -> Iterable[Tuple[int, int, float]]:
-        """Yield valid neighbour cells and step distance in cell-units (1.0 cardinal, sqrt(2) diagonal)."""
         base = [
             (c - 1, r, 1.0), (c + 1, r, 1.0), (c, r - 1, 1.0), (c, r + 1, 1.0)
         ]
@@ -180,7 +160,6 @@ class Drone:
                 yield nc, nr, step_cost
 
     def _heuristic(self, a: Tuple[int, int], b: Tuple[int, int], euclidean: bool = True) -> float:
-        """Admissible heuristic: Euclidean (when diagonal allowed) or Manhattan otherwise."""
         dx = b[0] - a[0]
         dy = b[1] - a[1]
         if euclidean and self.allow_diagonal:
@@ -188,9 +167,6 @@ class Drone:
         return abs(dx) + abs(dy)
 
     def _astar_path(self, start: Tuple[int, int], goal: Tuple[int, int], carry_weight: float) -> List[Tuple[int, int]]:
-        """
-        A* minimizing energy (not raw steps). Returns list of adjacent cells from start(exclusive) to goal(inclusive).
-        """
         if start == goal:
             return []
 
@@ -208,7 +184,6 @@ class Drone:
             visited.add(current)
 
             if current == goal:
-                # reconstruct path (exclude start)
                 rev = []
                 cur = current
                 while cur is not None and cur != start:
@@ -221,38 +196,29 @@ class Drone:
                 neighbor = (nc, nr)
                 step_energy = step_cell_dist * self.BASE_COST_PER_CELL * weight_mul
                 tentative_g = gscore[current] + step_energy
-
                 if neighbor not in gscore or tentative_g + 1e-9 < gscore[neighbor]:
                     gscore[neighbor] = tentative_g
                     came_from[neighbor] = current
                     h = self._heuristic(neighbor, goal, euclidean=True) * self.BASE_COST_PER_CELL * weight_mul
                     heapq.heappush(open_heap, (tentative_g + h, neighbor))
 
-        # unreachable (shouldn't happen on open grid)
         return []
 
     # -------------------------
-    # Public movement API
+    # Movement API
     # -------------------------
     def clear_path(self):
-        """Stop moving and clear any stored plan."""
         self.path = []
         self._path_step_idx = 0
         self.target = None
         self.moving = False
 
     def current_target_cell(self) -> Optional[Tuple[int, int]]:
-        """Return the next planned cell (adjacent step) if any."""
         if 0 <= self._path_step_idx < len(self.path):
             return self.path[self._path_step_idx]
         return None
 
     def set_target_cell(self, col: int, row: int):
-        """
-        Compute a planned route and begin moving.
-        - If allow_direct=True we prefer moving straight to the final goal center (smooth diagonal).
-        - Otherwise compute A* adjacent-step path that accounts for carry weight.
-        """
         if self.lost:
             return
 
@@ -269,7 +235,6 @@ class Drone:
         goal = (col, row)
         carry_weight = self.carrying.weight if self.carrying else 0.0
 
-        # Prefer direct straight-line move if enabled (smooth diagonal)
         if self.allow_direct:
             self.path = [goal]
             self._path_step_idx = 0
@@ -278,7 +243,6 @@ class Drone:
             self.moving = True
             return
 
-        # Otherwise compute energy-aware A* adjacent steps
         new_path = self._astar_path(start, goal, carry_weight)
         if not new_path:
             self.clear_path()
@@ -292,7 +256,6 @@ class Drone:
         self.moving = True
 
     def _advance_path_step(self):
-        """Advance to next step (used when A* path is active)."""
         self._path_step_idx += 1
         if self._path_step_idx >= len(self.path):
             self.clear_path()
@@ -303,16 +266,11 @@ class Drone:
         self.moving = True
 
     # -------------------------
-    # Movement + energy update
+    # Update (movement + energy)
     # -------------------------
     def update(self, dt: float, speed: float, anim_fps: float,
                rot_frames_with_parcel: Optional[List[pygame.Surface]],
                rot_frames: Optional[List[pygame.Surface]]):
-        """
-        Called each frame by the game loop.
-        - speed is pixels per second.
-        - consumes energy proportional to Euclidean distance moved (cells = pixels / grid_size).
-        """
         if self.lost:
             self.moving = False
             return
@@ -331,7 +289,6 @@ class Drone:
                 energy_cost = self.energy_needed_for_cells(cells_moved, carrying_weight)
                 self.power.consume(energy_cost)
 
-                # if battery drains mid-move, set lost and place where it ran out
                 if self.power.is_depleted():
                     if move > 0 and dist_pixels > 0:
                         self.pos += direction.normalize() * move
@@ -340,14 +297,12 @@ class Drone:
                     self.target = None
                     return
 
-                # actually move
                 if move >= dist_pixels - 1e-9:
                     self.pos = self.target
                     self.arrive()
                 else:
                     self.pos += direction.normalize() * move
 
-            # animate rotors while moving
             self.anim_t += dt
             if anim_fps > 0 and self.anim_t >= 1.0 / anim_fps:
                 self.anim_t = 0.0
@@ -361,7 +316,6 @@ class Drone:
             self.anim_frame = 0
 
     def arrive(self):
-        """Snap to integer cell center and advance step if using an adjacent path."""
         self.col = int(self.pos.x // self.grid_size)
         self.row = int(self.pos.y // self.grid_size)
         self.pos = pygame.Vector2(self.col * self.grid_size + self.grid_size / 2,
@@ -369,26 +323,22 @@ class Drone:
         self.target = None
         self.moving = False
 
-        # if A* adjacent path was in use then advance index
         if self.path and self._path_step_idx < len(self.path):
             expected = self.path[self._path_step_idx]
             if (self.col, self.row) == expected:
                 self._advance_path_step()
             else:
-                # mismatch -> clear defensively
                 self.clear_path()
 
     # -------------------------
-    # Pick / Drop (energy aware)
+    # Pick / Drop
     # -------------------------
     def perform_pick(self, parcel: 'Parcel') -> bool:
-        """Pick a parcel: consumes pick energy (weight-aware). Returns True on success."""
         if parcel is None:
             return False
         cost = self.energy_needed_for_pick_drop(parcel.weight)
         self.power.consume(cost)
         if self.power.is_depleted():
-            # aborted: drone lost mid-pick
             self.lost = True
             return False
         parcel.picked = True
@@ -397,13 +347,11 @@ class Drone:
         return True
 
     def perform_drop(self, parcel: 'Parcel') -> bool:
-        """Drop the parcel at current cell; consumes drop energy and may set lost if battery drained."""
         if parcel is None:
             return False
         cost = self.energy_needed_for_pick_drop(parcel.weight)
         self.power.consume(cost)
         if self.power.is_depleted():
-            # still place parcel but drone becomes lost
             parcel.picked = False
             parcel.col = self.col
             parcel.row = self.row
@@ -427,7 +375,6 @@ class Drone:
     # Distance & energy helpers
     # -------------------------
     def distance_cells_to(self, col: int, row: int, metric: str = "manhattan") -> float:
-        """Distance between current integer cell and target in cell-units."""
         cur_col = int(self.col)
         cur_row = int(self.row)
         dx = abs(col - cur_col)
@@ -439,17 +386,12 @@ class Drone:
         return float(dx + dy)
 
     def energy_needed_for_cells(self, n_cells: float, weight: float = 0.0) -> float:
-        """Energy to travel `n_cells` cells while carrying `weight`."""
         return float(n_cells) * self.BASE_COST_PER_CELL * (1.0 + weight * self.WEIGHT_FACTOR)
 
     def energy_needed_for_pick_drop(self, weight: float = 0.0) -> float:
         return float(self.PICK_DROP_COST) * (1.0 + weight * self.WEIGHT_FACTOR)
 
     def can_reach_and_return(self, target_col: int, target_row: int, home_col: int, home_row: int) -> bool:
-        """
-        Conservative feasibility check using Euclidean distances when diagonal allowed.
-        Adds small margin for pick/drop.
-        """
         if self.allow_diagonal:
             dist_to_target = self.distance_cells_to(target_col, target_row, metric="euclidean")
             dist_target_to_home = self.distance_cells_to(home_col, home_row, metric="euclidean")
@@ -460,21 +402,13 @@ class Drone:
         carrying_weight = self.carrying.weight if self.carrying else 0.0
         needed = self.energy_needed_for_cells(dist_to_target, carrying_weight) + \
                  self.energy_needed_for_cells(dist_target_to_home, 0.0) + \
-                 self.energy_needed_for_pick_drop(0.0)  # small margin
+                 self.energy_needed_for_pick_drop(0.0)
         return self.power.level >= needed
 
     # -------------------------
-    # Drawing (keeps visuals similar to your earlier draw)
+    # Drawing
     # -------------------------
     def draw(self, surf, images: dict):
-        """
-        images keys:
-          - drone_static
-          - drone_rot_frames (list)
-          - drone_static_with_parcel
-          - drone_rot_with_parcel_frames (list)
-          - parcel_img
-        """
         x, y = int(self.pos.x), int(self.pos.y)
         img = None
 
@@ -502,7 +436,6 @@ class Drone:
         else:
             pygame.draw.circle(surf, (3, 54, 96), (x, y), int(self.grid_size * 0.35))
 
-        # overlay parcel if carrying and no dedicated with-parcel image
         if self.carrying and not images.get("drone_static_with_parcel") and not images.get("drone_rot_with_parcel_frames"):
             parcel_img = images.get("parcel_img")
             if parcel_img:
@@ -513,53 +446,40 @@ class Drone:
                 pygame.draw.rect(surf, (200, 160, 60),
                                  (x - s // 2, y + int(self.grid_size * 0.18) - s // 2, s, s))
 
-        # ----------------------------
-        # Battery icon and percent
-        # ----------------------------
         try:
             pct = int(self.power.percent())
         except Exception:
             pct = 0
 
-        # dimensions relative to grid size
         bar_w = max(28, int(self.grid_size * 0.28))
         bar_h = max(8, int(self.grid_size * 0.08))
         corner = 3
-
-        # position the battery just above the drone image
         bar_x = x - bar_w // 2
         bar_y = y - int(self.grid_size * 0.45) - bar_h
-
-        # outline
         outline_rect = pygame.Rect(bar_x, bar_y, bar_w, bar_h)
         try:
             pygame.draw.rect(surf, (30, 30, 30), outline_rect, border_radius=corner)
         except TypeError:
             pygame.draw.rect(surf, (30, 30, 30), outline_rect)
-        # inner fill background (dark)
         inner_rect = pygame.Rect(bar_x + 2, bar_y + 2, bar_w - 4, bar_h - 4)
         try:
             pygame.draw.rect(surf, (60, 60, 60), inner_rect, border_radius=corner)
         except TypeError:
             pygame.draw.rect(surf, (60, 60, 60), inner_rect)
 
-        # fill width based on pct
         fill_w = max(1, int((inner_rect.width) * max(0.0, pct) / 100.0))
         fill_rect = pygame.Rect(inner_rect.x, inner_rect.y, fill_w, inner_rect.height)
-
         if pct >= 60:
-            fill_color = (80, 200, 80)  # green
+            fill_color = (80, 200, 80)
         elif pct >= 30:
-            fill_color = (240, 200, 80)  # yellow
+            fill_color = (240, 200, 80)
         else:
-            fill_color = (220, 80, 80)  # red
-
+            fill_color = (220, 80, 80)
         try:
             pygame.draw.rect(surf, fill_color, fill_rect, border_radius=corner)
         except TypeError:
             pygame.draw.rect(surf, fill_color, fill_rect)
 
-        # small percent text to the right of the battery
         try:
             fnt = pygame.font.SysFont("Consolas", max(10, int(self.grid_size * 0.08)))
             txt = fnt.render(f"{pct}%", True, (20, 20, 20))
@@ -568,7 +488,6 @@ class Drone:
         except Exception:
             pass
 
-        # If drone is lost, draw a small red X over it
         if getattr(self, "lost", False):
             sz = max(8, int(self.grid_size * 0.15))
             pygame.draw.line(surf, (200, 40, 40), (x - sz, y - sz), (x + sz, y + sz), 3)
@@ -576,12 +495,6 @@ class Drone:
 
 
 class DeliveryStation:
-    """Delivery station occupying a rectangular block of grid cells.
-
-    Tracks per-cell usage counts in `usage` to allow controllers to select
-    least-used cells and to avoid repeating the same cell every time.
-    """
-
     def __init__(self, col: int, row: int, grid_size: int, w: int = 2, h: int = 2):
         self.col = int(col)
         self.row = int(row)
@@ -592,30 +505,22 @@ class DeliveryStation:
         center_row = row + (self.h - 1) / 2
         self.pos = pygame.Vector2(center_col * grid_size + grid_size / 2,
                                   center_row * grid_size + grid_size / 2)
-        self.delivered = 0  # counter for deliveries to this station
-        # usage count per cell (col,row) => number of deliveries there
+        self.delivered = 0
         self.usage = defaultdict(int)
 
     def register_delivery(self, cell: Tuple[int, int]):
-        """Record a delivery into a cell inside the station. Caller should ensure the cell belongs to the station."""
         self.usage[(int(cell[0]), int(cell[1]))] += 1
         self.delivered += 1
 
     def free_cells(self, terrain) -> List[Tuple[int, int]]:
-        """Return list of station cells that are currently free of *any* non-picked parcel (delivered parcels also occupy)."""
-        # NOTE: we treat delivered parcels as occupying the cell for drop-placement decisions,
-        # because you wanted delivered parcels to remain visible and not be pickable; they should
-        # also block future drops unless explicitly allowed.
         cells = [(c, r) for r in range(self.row, self.row + self.h) for c in range(self.col, self.col + self.w)]
         free = [c for c in cells if not terrain.occupied_cell(c[0], c[1])]
         return free
 
     def least_used_free_cell(self, terrain) -> Optional[Tuple[int, int]]:
-        """Return the free station cell with smallest usage (deterministic). None if no free cell."""
         free = self.free_cells(terrain)
         if not free:
             return None
-        # sort by usage then by coordinate to have deterministic tie-break
         free.sort(key=lambda c: (self.usage.get((c[0], c[1]), 0), c[1], c[0]))
         return free[0]
 
@@ -627,14 +532,11 @@ class DeliveryStation:
         y = self.row * self.grid_size
         width = self.w * self.grid_size
         height = self.h * self.grid_size
-
         s = pygame.Surface((width, height), pygame.SRCALPHA)
-        s.fill((30, 110, 200, 60))  # translucent blue
+        s.fill((30, 110, 200, 60))
         surf.blit(s, (x, y))
-
         rect = pygame.Rect(x, y, width, height)
         pygame.draw.rect(surf, (40, 120, 200), rect, 3)
-
         font = pygame.font.SysFont("Consolas", max(12, self.grid_size // 6))
         txt = font.render(str(self.delivered), True, (255, 255, 255))
         surf.blit(txt, (x + 6, y + 6))
@@ -655,19 +557,14 @@ class Terrain:
         for _ in range(n):
             c = random.randint(0, cols - 1)
             r = random.randint(0, rows - 1)
-            # random weight between 0.5 and 2.0
             w = random.uniform(0.5, 2.0)
             self.add_parcel(c, r, weight=w)
 
     def add_parcel(self, col: int, row: int, weight: float = 1.0):
-        # only add if no (undelivered/unpicked) parcel at cell and not inside station
         if self.parcel_at_cell(col, row) is None and not self.is_station_cell(col, row):
             self.parcels.append(Parcel(col, row, self.grid_size, weight=weight))
 
     def parcel_at_cell(self, col: int, row: int, include_delivered: bool = False) -> Optional[Parcel]:
-        """
-        Return parcel at (col,row) that is pickable (not picked and not delivered), unless include_delivered=True.
-        """
         for p in self.parcels:
             if p.col == col and p.row == row:
                 if p.picked:
@@ -678,15 +575,10 @@ class Terrain:
         return None
 
     def occupied_cell(self, col: int, row: int) -> bool:
-        """
-        Return True if the cell contains any parcel that is not currently picked (includes delivered).
-        This is the occupancy definition used for choosing drop cells.
-        """
         for p in self.parcels:
             if p.col == col and p.row == row:
                 if p.picked:
                     continue
-                # if parcel exists here and is not picked (delivered or undelivered), consider occupied
                 return True
         return False
 
