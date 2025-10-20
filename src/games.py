@@ -7,7 +7,8 @@ from pathlib import Path
 
 from artifacts import Terrain, Drone
 from utils import load_image, scale_to_cell
-from controllers import HumanAgentController, AIAgentController, ControllerSwitcher
+# Import controllers and the shared RESERVATIONS mapping so HUD/debug can inspect it.
+from controllers import HumanAgentController, AIAgentController, ControllerSwitcher, RESERVATIONS
 
 pygame.init()
 # Start fullscreen
@@ -140,242 +141,324 @@ def show_splash(timeout=4.0, splash_name="drone_static.png"):
             return
 
 
-def show_setup(initial=15, min_val=0, max_val=500):
+def show_setup(initial_parcels=15, initial_drones=1, min_val=0, max_val=500):
     """
-    Setup screen to choose number of parcels.
-    - Up/Down to change
-    - Type digits to enter number
-    - Enter to accept
-    - ESC to quit
-    Returns selected integer.
+    Setup screen to choose number of parcels and number of drones.
+    - Up/Down keys to increase or decrease values
+    - Type digits directly to enter a number
+    - Press Enter to confirm and move to next step
+    - Press ESC to quit the game
+    Returns: (num_parcels, num_drones)
     """
-    value = initial
-    typing = ""
-    while True:
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
-            if e.type == pygame.KEYDOWN:
-                if e.key == pygame.K_ESCAPE:
+
+    # Helper inner function to collect a single integer input interactively.
+    def get_number(prompt_text, initial_value):
+        value = initial_value
+        typing = ""
+
+        while True:
+            # Poll for all pygame events like keyboard and quit.
+            for e in pygame.event.get():
+
+                # Allow window close or ESC to exit the program entirely.
+                if e.type == pygame.QUIT:
                     pygame.quit()
                     sys.exit()
-                elif e.key == pygame.K_RETURN or e.key == pygame.K_KP_ENTER:
-                    # finalize typed value if any
-                    if typing:
+                if e.type == pygame.KEYDOWN:
+                    # ESC aborts entirely
+                    if e.key == pygame.K_ESCAPE:
+                        pygame.quit()
+                        sys.exit()
+                    # ENTER confirms current value (either typed or the shown value)
+                    elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        if typing:
+                            try:
+                                v = int(typing)
+                                value = max(min_val, min(max_val, v))
+                            except ValueError:
+                                pass
+                        return value
+                    elif e.key == pygame.K_BACKSPACE:
+                        typing = typing[:-1]
+                    elif e.key == pygame.K_UP:
+                        value = min(max_val, value + 1)
+                        typing = ""
+                    elif e.key == pygame.K_DOWN:
+                        value = max(min_val, value - 1)
+                        typing = ""
+                    elif getattr(e, "unicode", "").isdigit():
+                        # accumulate typed digits
+                        typing += e.unicode
                         try:
                             v = int(typing)
-                            value = max(min_val, min(max_val, v))
+                            if v > max_val:
+                                typing = str(max_val)
                         except ValueError:
-                            pass
-                    return value
-                elif e.key == pygame.K_BACKSPACE:
-                    typing = typing[:-1]
-                elif e.key == pygame.K_UP:
-                    value = min(max_val, value + 1)
-                    typing = ""
-                elif e.key == pygame.K_DOWN:
-                    value = max(min_val, value - 1)
-                    typing = ""
-                elif e.unicode.isdigit():
-                    typing += e.unicode
-                    # clamp visible typed number
-                    try:
-                        v = int(typing)
-                        if v > max_val:
-                            typing = str(max_val)
-                    except ValueError:
-                        typing = ""
-        screen.fill((40, 44, 52))
-        header = large_font.render("Simulation Setup", True, (230, 230, 230))
-        prompt = font.render("Enter number of parcels to spawn (Up/Down or type digits):", True, (210, 210, 210))
-        value_display = title_font.render(str(value) if not typing else typing, True, (240, 240, 200))
-        hint = font.render("Enter to start | ESC to quit", True, (200, 200, 200))
-        screen.blit(header, header.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 140)))
-        screen.blit(prompt, prompt.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 60)))
-        screen.blit(value_display, value_display.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 20)))
-        screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 140)))
-        pygame.display.flip()
-        clock.tick(60)
+                            typing = ""
 
+            # Draw the setup screen contents (simple, centered UI)
+            screen.fill((40, 44, 52))
+            header = large_font.render("Simulation Setup", True, (230, 230, 230))
+            prompt = font.render(prompt_text, True, (210, 210, 210))
+            value_display = title_font.render(
+                str(value) if not typing else typing, True, (240, 240, 200)
+            )
+            hint = font.render("Enter to confirm | ESC to quit", True, (200, 200, 200))
 
-def run_game(initial_parcels):
-    # Create terrain and agents
+            screen.blit(header, header.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 140)))
+            screen.blit(prompt, prompt.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 60)))
+            screen.blit(value_display, value_display.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 20)))
+            screen.blit(hint, hint.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 140)))
+
+            pygame.display.flip()
+            clock.tick(60)
+
+    # Ask the user for number of parcels
+    num_parcels = get_number("Enter number of parcels to spawn:", initial_parcels)
+
+    # Ask the user for number of drones to deploy
+    num_drones = get_number("Enter number of drones to deploy:", initial_drones)
+
+    return num_parcels, num_drones
+
+def run_game(initial_parcels, num_drones):
+    """
+    Main simulation loop for multiple drones.
+    - Spawns terrain, parcels, and multiple drones.
+    - Each drone is controlled by its own AI controller.
+    - HUD shows per-drone battery/status plus overall stats and reservations.
+    """
+
+    # -----------------------------
+    # 1) Create the world and populate parcels
+    # -----------------------------
     terrain = Terrain(GRID_SIZE, (SCREEN_W, SCREEN_H), parcel_img=images["parcel_img"], parcel_scale=PARCEL_SCALE)
-    start_col = (SCREEN_W // GRID_SIZE) // 2
-    start_row = (SCREEN_H // GRID_SIZE) // 2
-    # spawn parcels based on setup entry
     terrain.spawn_random(initial_parcels)
+    print(f"Spawned {initial_parcels} parcels")
 
-    # Add exactly one delivery station in the center with area 4x4
+    # -----------------------------
+    # 2) Add a delivery station in the center of the map
+    # -----------------------------
     cols = SCREEN_W // GRID_SIZE
     rows = SCREEN_H // GRID_SIZE
     center_col = max(2, cols // 2 - 2)
     center_row = max(2, rows // 2 - 2)
     terrain.add_station(center_col, center_row, w=4, h=4)
 
-    drone = Drone((start_col, start_row), GRID_SIZE, (SCREEN_W, SCREEN_H))
+    # -----------------------------
+    # 3) Create multiple Drone objects and AI controllers
+    # -----------------------------
+    drones = []
+    ai_controllers = []
 
-    # Controllers
-    human = HumanAgentController(drone, terrain)
-    ai = AIAgentController(drone, terrain)
-    switcher = ControllerSwitcher([human, ai])
+    for i in range(num_drones):
+        # Distribute drones around the center to avoid stacking exactly on top of each other.
+        # Compute a small offset from the center and clamp to bounds.
+        offset = (i - (num_drones - 1) / 2.0) * 2  # spreads drones horizontally
+        start_col = int(min(max(0, cols // 2 + round(offset)), cols - 1))
+        start_row = int(min(max(0, rows // 2), rows - 1))
 
-    # *** Make AI the default controller at startup so simulation uses AI behavior immediately. ***
-    # If you prefer Human-first, remove or change the next line.
-    switcher.index = 1
+        drone = Drone((start_col, start_row), GRID_SIZE, (SCREEN_W, SCREEN_H))
+        drones.append(drone)
 
+        # Give each drone an AI controller
+        ai = AIAgentController(drone, terrain)
+        ai_controllers.append(ai)
+
+    print(f"Deployed {len(drones)} drone(s)")
+
+    # Pre-warm planner and reservations so drones begin acting quickly
+    for ai in ai_controllers:
+        try:
+            ai._cleanup_reservations(force=True)
+        except Exception:
+            pass
+        try:
+            ai._request_plan(force_refresh=True)
+        except Exception:
+            # If planner is unavailable, controllers will fall back to greedy behavior
+            pass
+
+    # -----------------------------
+    # 4) Initialize fonts and counters
+    # -----------------------------
     font_local = pygame.font.SysFont("Consolas", 20)
     narration_font = pygame.font.SysFont("Consolas", 22)
-
-    # Flash state for cell feedback when picking or dropping
     flash_timer = 0.0
     flash_color = None
     flash_cell = None
-
-    # Delivery counters and timed session state
     total_delivered = 0
     session_delivered = 0
     session_active = False
     session_time_left = 0.0
-    SESSION_DEFAULT_SECONDS = 60.0
+    lost_drones.clear()
 
+    # -----------------------------
+    # 5) Simulation timing
+    # -----------------------------
     running = True
-    dt = 0
+    dt = 0.0
+
+    # -----------------------------
+    # 6) Main loop
+    # -----------------------------
     while running:
-        # events: always let switcher see the event first so TAB works reliably
+        # --- event handling (global) ---
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 running = False
-
-            # give controllers a first chance to process the event (TAB handled here)
-            switcher.handle_event(e)
-
-            # global keys that should not block controller switching
             if e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_ESCAPE:
                     running = False
                 elif e.key == pygame.K_s:
-                    # start a timed delivery session
+                    # start a timed delivery session (optional)
                     session_active = True
-                    session_time_left = SESSION_DEFAULT_SECONDS
+                    session_time_left = 60.0
                     session_delivered = 0
                 elif e.key == pygame.K_r:
-                    # reset counts and session
                     total_delivered = 0
                     session_delivered = 0
                     session_active = False
                     session_time_left = 0.0
-
-            # Mouse parcel placement
+            # allow placing parcels with mouse left click (same rule: don't place inside station)
             if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 mx, my = e.pos
-                col, row = int(mx // GRID_SIZE), int(my // GRID_SIZE)
-                # prevent placing inside station area
-                if not terrain.is_station_cell(col, row):
-                    terrain.add_parcel(col, row)
+                ccol, crow = int(mx // GRID_SIZE), int(my // GRID_SIZE)
+                if not terrain.is_station_cell(ccol, crow):
+                    terrain.add_parcel(ccol, crow)
 
-        # update controller logic (human or AI)
-        switcher.update(dt)
+        # --- update AI controllers first (they decide targets / pick/drop) ---
+        for ai in ai_controllers:
+            try:
+                ai.update(dt)
+            except Exception:
+                # defensive: don't let one controller crash the loop
+                print("AI controller update error", flush=True)
 
-        # after controllers run, check if drone reported an action for flash feedback
-        if hasattr(drone, "_last_action") and drone._last_action:
+        # If planners are down or plans are empty, let idle AIs try greedy claim immediately.
+        # This encourages concurrency: every idle AI will attempt to claim the nearest unreserved parcel.
+        for ai in ai_controllers:
+            try:
+                # if not moving, not carrying and no plan, greedy-claim
+                if (not ai.drone.moving) and (ai.drone.carrying is None) and (not ai.plan):
+                    parcel = None
+                    try:
+                        parcel = ai._find_nearest_unreserved_parcel()
+                    except Exception:
+                        parcel = None
+                    if parcel:
+                        try:
+                            claimed = ai._try_claim_and_go_to_parcel(parcel)
+                            if claimed:
+                                # refresh reservations for HUD
+                                ai._cleanup_reservations()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # --- advance drone physics and energy consumption ---
+        for drone in drones:
+            drone.update(dt, SPEED, ANIM_FPS, images.get("drone_rot_with_parcel_frames"), images.get("drone_rot_frames"))
+
+        # --- process per-drone _last_action (pick/drop/pick_failed/drop_failed) ---
+        # This mirrors the single-drone logic but runs for each drone.
+        for drone in drones:
+            if not hasattr(drone, "_last_action") or drone._last_action is None:
+                continue
+
             kind = drone._last_action[0]
             if kind == "pick":
                 _, cell, parcel = drone._last_action
                 flash_color = (60, 220, 100, 160)
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
+
             elif kind == "drop":
                 _, cell, parcel = drone._last_action
                 flash_color = (240, 120, 120, 160)
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
 
-                # only mark and count delivery if the parcel reference is valid and not already delivered
+                # If parcel is valid and not already counted as delivered, mark delivered and register with station.
                 if parcel and not getattr(parcel, "delivered", False):
-                    # mark parcel delivered
                     parcel.delivered = True
                     parcel.picked = False
 
-                    # station accounting
+                    # Station registration so station usage bookkeeping is correct
                     station = terrain.get_station_at(cell[0], cell[1])
                     if station:
                         station.register_delivery(cell)
-                        # now station.usage tracks counts per cell
+
+                    # increment counters
                     total_delivered += 1
                     if session_active:
                         session_delivered += 1
 
+                    # Defensive: remove any reservation entries that match this parcel's original cell or drop cell
+                    try:
+                        # remove exact match keys (pickup cell might match parcel.col/row before move)
+                        pickup_key = (int(parcel.col), int(parcel.row))
+                        RESERVATIONS.pop(pickup_key, None)
+                    except Exception:
+                        pass
+                    # Additionally, clear any reservation that references the drop cell
+                    RESERVATIONS.pop((cell[0], cell[1]), None)
+
             elif kind == "pick_failed":
                 _, cell, _ = drone._last_action
-                flash_color = (240, 200, 80, 160)  # yellow-ish
+                flash_color = (240, 200, 80, 160)
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
 
             elif kind == "drop_failed":
                 _, cell, _ = drone._last_action
-                flash_color = (240, 200, 80, 160)  # yellow-ish
+                flash_color = (240, 200, 80, 160)
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
 
-            # clear the action so we do not process it again
+            # After handling, clear drone._last_action so we don't double-count
             drone._last_action = None
 
-        # update session timer
-        if session_active:
-            session_time_left -= dt
-            if session_time_left <= 0:
-                session_active = False
-                session_time_left = 0.0
+        # --- detect newly lost drones and log/report them ---
+        for drone in drones:
+            if getattr(drone, "lost", False) and not getattr(drone, "_reported_lost", False):
+                info = {
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                    "col": int(drone.col),
+                    "row": int(drone.row),
+                    "x": float(drone.pos.x),
+                    "y": float(drone.pos.y),
+                    "battery_pct": int(drone.power.percent()) if hasattr(drone, "power") else 0,
+                    "carrying": getattr(drone.carrying, "col", None) is not None
+                }
+                lost_drones.append(info)
+                try:
+                    with open(LOST_LOG_PATH, "a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"{info['time']} - LOST at cell ({info['col']},{info['row']}) pos ({info['x']:.1f},{info['y']:.1f}) battery {info['battery_pct']}% carrying {info['carrying']}\n")
+                except Exception:
+                    pass
+                drone._reported_lost = True
 
-        # update drone physics/animation
-        drone.update(dt, SPEED, ANIM_FPS, images.get("drone_rot_with_parcel_frames"), images.get("drone_rot_frames"))
-
-        # ------ detect newly lost drones and log/report them ------
-        if getattr(drone, "lost", False) and not getattr(drone, "_reported_lost", False):
-            info = {
-                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                "col": int(drone.col),
-                "row": int(drone.row),
-                "x": float(drone.pos.x),
-                "y": float(drone.pos.y),
-                "battery_pct": int(drone.power.percent()) if hasattr(drone, "power") else 0,
-                "carrying": getattr(drone.carrying, "col", None) is not None
-            }
-            lost_drones.append(info)
-            # append to log file
-            try:
-                with open(LOST_LOG_PATH, "a", encoding="utf-8") as fh:
-                    fh.write(
-                        f"{info['time']} - LOST at cell ({info['col']},{info['row']}) pos ({info['x']:.1f},{info['y']:.1f}) battery {info['battery_pct']}% carrying {info['carrying']}\n")
-            except Exception:
-                pass
-            drone._reported_lost = True
-
-        # draw
+        # --- drawing ---
         screen.fill((192, 192, 192))
 
-        # grid
-        cols = SCREEN_W // GRID_SIZE
-        rows = SCREEN_H // GRID_SIZE
+        # grid lines
         for x in range(0, SCREEN_W, GRID_SIZE):
             pygame.draw.line(screen, (200, 200, 200), (x, 0), (x, SCREEN_H))
         for y in range(0, SCREEN_H, GRID_SIZE):
             pygame.draw.line(screen, (200, 200, 200), (0, y), (SCREEN_W, y))
 
-        # draw parcels via terrain
+        # draw parcels and stations
         terrain.draw(screen)
-
-        # draw stations (they draw a multi-cell highlighted area)
         for s in terrain.stations:
-            # defensive draw call - some station implementations expect surf kw
             try:
                 s.draw(surf=screen)
             except TypeError:
                 s.draw(screen)
 
-        # draw flash cell under drone if active
+        # flash cell under drone if active
         if flash_timer > 0 and flash_cell is not None:
             cell_x = flash_cell[0] * GRID_SIZE
             cell_y = flash_cell[1] * GRID_SIZE
@@ -388,77 +471,86 @@ def run_game(initial_parcels):
                 flash_cell = None
                 flash_color = None
 
-        # draw drone (drone.draw now shows battery icon and lost X if Drone implements it)
-        drone.draw(screen, images)
+        # draw every drone
+        for drone in drones:
+            drone.draw(screen, images)
 
         # ---------------------------
-        # HUD panel on the left
+        # HUD: show summary + per-drone lines for debugging
         # ---------------------------
-        #
-        # This draws a translucent HUD panel on the left. To adjust:
-        # - hud_w controls width (we set it to 28% of screen width).
-        # - hud_h is computed from number of lines, but you may fix it if you want.
-        # - left_margin controls horizontal offset from left edge.
-        # - top_margin controls vertical offset from top edge.
-        #
+        # count of field parcels remaining (not picked, not delivered)
+        field_remaining = sum(1 for p in terrain.parcels if not getattr(p, "delivered", False) and not getattr(p, "picked", False))
+
         hud_lines = [
-            f"Controller: {switcher.current.__class__.__name__} | Cells: {SCREEN_W // GRID_SIZE} x {SCREEN_H // GRID_SIZE}",
-            f"Drone cell: ({drone.col}, {drone.row})   carrying: {drone.carrying is not None}   Battery: {int(drone.power.percent()) if hasattr(drone, 'power') else 0}%",
-            f"Total delivered: {total_delivered}    Session delivered: {session_delivered}    Session time left: {int(session_time_left)}s",
+            f"Drones: {len(drones)} | Parcels (objects): {len(terrain.parcels)} | Field remaining: {field_remaining} | Delivered: {total_delivered}",
+            f"Avg battery: {int(sum(d.power.percent() for d in drones) / len(drones)) if drones else 0}%",
             f"Lost drones: {len(lost_drones)}"
         ]
-        if lost_drones:
-            last = lost_drones[-1]
-            hud_lines.append(
-                f"Last lost: {last['time']} @ ({last['col']},{last['row']}) battery {last['battery_pct']}%")
-        hud_lines.append(
-            f"Controls: Hold arrow keys for continuous movement (diagonals allowed).\n"
-            f"Space = pick up or drop.\nTAB to switch controller.\nS = start session (60s).\nR = reset counts.\nESC to quit.")
 
-        # panel layout params
-        hud_w = int(SCREEN_W * 0.35)  # width 35% of screen; increase for wider HUD
-        left_margin = 12  # distance from left edge
-        top_margin = 12  # distance from top edge
-        line_h = 26
-        padding = 12
+        # Per-drone details (index, battery %, carrying, target, last_status)
+        for idx, d in enumerate(drones):
+            carrying = "Y" if d.carrying else "-"
+            lost_flag = " LOST" if getattr(d, "lost", False) else ""
+            # get controller status if available
+            ai_status = ""
+            try:
+                ai_status = ai_controllers[idx].last_status or ""
+            except Exception:
+                ai_status = ""
+            # compute current target cell (either drone.target in world coords -> convert to cell,
+            # or the next A* cell via drone.current_target_cell)
+            tgt_cell = None
+            try:
+                ct = d.current_target_cell()
+                if ct:
+                    tgt_cell = ct
+                elif d.target:
+                    tgt_cell = (int(d.target.x // d.grid_size), int(d.target.y // d.grid_size))
+            except Exception:
+                tgt_cell = None
+            tgt_str = f"{tgt_cell}" if tgt_cell else "-"
+            hud_lines.append(f"#{idx} cell:({d.col},{d.row}) bat:{int(d.power.percent())}% carry:{carrying} tgt:{tgt_str} status:{ai_status}{lost_flag}")
 
-        # compute HUD height dynamically from lines (with some padding)
-        hud_h = int(SCREEN_W * 0.095)  # padding * 2 + max(len(hud_lines), 1) * line_h
+        # Reservation overview (debug): show reserved pickup cells and which AI index owns them
+        if RESERVATIONS:
+            hud_lines.append("Reservations:")
+            for k, (owner, ts) in list(RESERVATIONS.items()):
+                owner_idx = None
+                for i, a in enumerate(ai_controllers):
+                    if a is owner:
+                        owner_idx = i
+                        break
+                owner_label = f"AI{owner_idx}" if owner_idx is not None else "unknown"
+                hud_lines.append(f"  {k} -> {owner_label}")
 
-        # create translucent surface for HUD
+        hud_lines.append("ESC to quit")
+
+        # draw HUD surface
+        hud_w = int(SCREEN_W * 0.35)
+        hud_h = int(max(140, 26 * len(hud_lines) + 20))
         hud_surf = pygame.Surface((hud_w, hud_h), pygame.SRCALPHA)
-        hud_surf.fill((245, 245, 250, 180))  # RGBA, last is alpha for translucency
+        hud_surf.fill((245, 245, 250, 180))
         try:
             pygame.draw.rect(hud_surf, (30, 30, 30), hud_surf.get_rect(), 2, border_radius=6)
         except TypeError:
             pygame.draw.rect(hud_surf, (30, 30, 30), hud_surf.get_rect(), 2)
 
-        # render lines onto HUD surface
         for i, line in enumerate(hud_lines):
             txt = font_local.render(line, True, (10, 10, 10))
-            hud_surf.blit(txt, (padding, padding + i * line_h))
+            hud_surf.blit(txt, (12, 12 + i * 26))
 
-        # blit HUD surface to screen
-        screen.blit(hud_surf, (left_margin, top_margin))
+        screen.blit(hud_surf, (12, 12))
 
-        # ---------------------------
-        # Narration panel on the right
-        # ---------------------------
+        # narration box: show last narration for first AI (optional)
         narration = None
-        try:
-            narration = getattr(switcher.current, "last_narration", None)
-        except Exception:
-            narration = None
-
+        if ai_controllers:
+            narration = getattr(ai_controllers[0], "last_narration", None)
         if narration:
-            # right-side narration panel defaults
-            box_w = int(SCREEN_W * 0.28)  # width 28% of screen; adjust for longer lines
-            box_h = int(SCREEN_H * 0.10)  # height 10% of screen; increase to show more lines
-            right_margin = 12  # distance from right edge; increase to move the box left
+            box_w = int(SCREEN_W * 0.28)
+            box_h = int(SCREEN_H * 0.10)
+            right_margin = 12
             box_x = SCREEN_W - box_w - right_margin
-            box_y = 12  # small top margin; change to move vertical position
-
-            # create surface with alpha for slight translucency
+            box_y = 12
             sbox = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
             sbox.fill((250, 250, 252, 230))
             try:
@@ -466,16 +558,12 @@ def run_game(initial_parcels):
             except TypeError:
                 pygame.draw.rect(sbox, (34, 34, 34), sbox.get_rect(), 3)
 
-            # header
-            hdr_txt = "Plan narration"
-            hdr = font_local.render(hdr_txt, True, (10, 10, 10))
+            hdr = font_local.render("Plan narration (AI0)", True, (10, 10, 10))
             sbox.blit(hdr, (12, 10))
 
-            # cheap word wrap
             words = narration.split()
             lines = []
             cur = ""
-            # approx chars per line based on width; tweak multiplier if fonts change
             approx_chars_per_line = max(50, (box_w // 16))
             for w in words:
                 if len(cur) + len(w) + 1 > approx_chars_per_line:
@@ -486,36 +574,32 @@ def run_game(initial_parcels):
             if cur:
                 lines.append(cur.strip())
 
-            # clamp lines to available vertical space
             line_h = 26
-            max_lines = max(4, (box_h - 60) // line_h)  # dynamic max lines based on height
+            max_lines = max(4, (box_h - 60) // line_h)
             truncated = False
             if len(lines) > max_lines:
                 lines = lines[:max_lines]
                 truncated = True
 
-            # draw lines
             start_y = 44
             for idx, ln in enumerate(lines):
                 txt = narration_font.render(ln, True, (28, 28, 28))
                 sbox.blit(txt, (12, start_y + idx * line_h))
-
             if truncated:
                 ell = narration_font.render("... (truncated)", True, (120, 120, 120))
                 sbox.blit(ell, (12, start_y + max_lines * line_h))
 
-            # blit the narration box at computed position
             screen.blit(sbox, (box_x, box_y))
 
         pygame.display.flip()
         dt = clock.tick(60) / 1000.0
 
+    # Clean up
     pygame.quit()
     sys.exit()
 
 
 if __name__ == "__main__":
-    # splash then setup flow
     show_splash(timeout=4.0)
-    parcels = show_setup(initial=15, min_val=0, max_val=1000)
-    run_game(parcels)
+    parcels, drones = show_setup(initial_parcels=15, initial_drones=1, min_val=0, max_val=1000)
+    run_game(parcels, drones)

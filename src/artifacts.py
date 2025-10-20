@@ -100,8 +100,8 @@ class Drone:
     """
 
     BASE_COST_PER_CELL = 0.4
-    WEIGHT_FACTOR = 1.5
-    PICK_DROP_COST = 0.7
+    WEIGHT_FACTOR = 0.8
+    PICK_DROP_COST = 0.4
 
     def __init__(self,
                  start_cell: Tuple[int, int],
