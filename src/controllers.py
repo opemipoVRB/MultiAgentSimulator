@@ -14,6 +14,9 @@ PLANNER = PlannerClient(use_llm=False)
 # The drone will be allowed to attempt pickup/drop and may become lost if battery drains mid-route.
 ALLOW_RISKY_TRIPS = True
 
+# Coordinator (strategy abstraction)
+from coordinator import COORD  # singleton coordinator; optional but preferred for assignment suggestions
+
 # -------------------------
 # Reservation (coordination) system (module-level)
 # -------------------------
@@ -674,7 +677,7 @@ class AIAgentController(BaseAgentController):
         return _set_and_return(chosen)
 
     # ---------------------------
-    # Main update loop (modified to use reservations + greedy fallback)
+    # Main update loop (modified to use reservations + greedy fallback + Coordinator)
     # ---------------------------
     def update(self, dt: float):
         # cooldown timer
@@ -891,10 +894,10 @@ class AIAgentController(BaseAgentController):
         # ---------- not carrying branch: attempt pickup steps ----------
         step = self._current_step()
         if not step:
-            # No planner step — try greedy fallback to nearest unreserved parcel.
+            # No planner step — try coordinator-provided assignment first, then greedy fallback.
             self.state = "idle"
 
-            # If we already have a reservation for some parcel, go to it
+            # 1) If we already have a reservation for some parcel, go to it
             my_reserved = None
             for (rc, rr), (owner, ts) in list(RESERVATIONS.items()):
                 if owner is self:
@@ -907,7 +910,32 @@ class AIAgentController(BaseAgentController):
                 self.last_status = f"going to my reserved {my_reserved}"
                 return
 
-            # otherwise attempt to find and claim the nearest parcel that we can attempt now
+            # 2) Ask the Coordinator for an assigned parcel (if Coordinator is being used)
+            assigned_parcel = None
+            try:
+                assigned_parcel = COORD.pop_assignment_for(self)
+            except Exception:
+                assigned_parcel = None
+
+            if assigned_parcel:
+                # Ensure it's still available and we can attempt it
+                if (not getattr(assigned_parcel, "picked", False) and
+                        not getattr(assigned_parcel, "delivered", False) and
+                        getattr(self, "_can_attempt_parcel", lambda parcel: True)(assigned_parcel)):
+                    # Try to claim via reservation + head there
+                    claimed = self._try_claim_and_go_to_parcel(assigned_parcel)
+                    if claimed:
+                        # coordinator assignment accepted
+                        return
+                    else:
+                        # failed to claim (race), fall through to greedy/replan below
+                        self.cooldown = max(self.cooldown, 0.2)
+                        self.last_status = "coord assign claim failed, will fallback"
+                else:
+                    # assigned parcel invalid -> ignore and fall through
+                    pass
+
+            # 3) Otherwise attempt to find and claim the nearest parcel that we can attempt now
             parcel = None
             try:
                 parcel = self._find_nearest_unreserved_parcel()

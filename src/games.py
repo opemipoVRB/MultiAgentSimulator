@@ -4,6 +4,7 @@ import sys
 import random
 import time
 from pathlib import Path
+from typing import Optional
 
 from artifacts import Terrain, Drone
 from utils import load_image, scale_to_cell
@@ -221,7 +222,8 @@ def show_setup(initial_parcels=15, initial_drones=1, min_val=0, max_val=500):
 
     return num_parcels, num_drones
 
-def run_game(initial_parcels, num_drones):
+
+def run_game(initial_parcels: int, num_drones: int):
     """
     Main simulation loop for multiple drones.
     - Spawns terrain, parcels, and multiple drones.
@@ -266,6 +268,22 @@ def run_game(initial_parcels, num_drones):
         ai_controllers.append(ai)
 
     print(f"Deployed {len(drones)} drone(s)")
+
+    # Optionally wire up an external Coordinator if present.
+    COORD = None
+    try:
+        # coordinator.py should expose a singleton COORD with register_controllers and tick functions
+        from coordinator import COORD as COORD_IMPORT  # type: ignore
+        COORD = COORD_IMPORT
+        try:
+            # register controllers so coordinator can assign tasks if it wants
+            COORD.register_controllers(ai_controllers)
+        except Exception:
+            # registration is best-effort
+            pass
+        print("[games] Coordinator detected and registered.")
+    except Exception:
+        COORD = None
 
     # Pre-warm planner and reservations so drones begin acting quickly
     for ai in ai_controllers:
@@ -327,6 +345,21 @@ def run_game(initial_parcels, num_drones):
                 if not terrain.is_station_cell(ccol, crow):
                     terrain.add_parcel(ccol, crow)
 
+        # --- If Coordinator exists, give it a chance to update / assign before controllers run ---
+        if COORD is not None:
+            try:
+                # tick may accept terrain, dt, or both depending on implementation
+                try:
+                    COORD.tick(terrain, dt)
+                except TypeError:
+                    try:
+                        COORD.tick(terrain)
+                    except TypeError:
+                        COORD.tick()
+            except Exception:
+                # coordinator failures shouldn't kill the loop
+                pass
+
         # --- update AI controllers first (they decide targets / pick/drop) ---
         for ai in ai_controllers:
             try:
@@ -359,7 +392,8 @@ def run_game(initial_parcels, num_drones):
 
         # --- advance drone physics and energy consumption ---
         for drone in drones:
-            drone.update(dt, SPEED, ANIM_FPS, images.get("drone_rot_with_parcel_frames"), images.get("drone_rot_frames"))
+            drone.update(dt, SPEED, ANIM_FPS, images.get("drone_rot_with_parcel_frames"),
+                         images.get("drone_rot_frames"))
 
         # --- process per-drone _last_action (pick/drop/pick_failed/drop_failed) ---
         # This mirrors the single-drone logic but runs for each drone.
@@ -479,7 +513,8 @@ def run_game(initial_parcels, num_drones):
         # HUD: show summary + per-drone lines for debugging
         # ---------------------------
         # count of field parcels remaining (not picked, not delivered)
-        field_remaining = sum(1 for p in terrain.parcels if not getattr(p, "delivered", False) and not getattr(p, "picked", False))
+        field_remaining = sum(
+            1 for p in terrain.parcels if not getattr(p, "delivered", False) and not getattr(p, "picked", False))
 
         hud_lines = [
             f"Drones: {len(drones)} | Parcels (objects): {len(terrain.parcels)} | Field remaining: {field_remaining} | Delivered: {total_delivered}",
@@ -509,7 +544,8 @@ def run_game(initial_parcels, num_drones):
             except Exception:
                 tgt_cell = None
             tgt_str = f"{tgt_cell}" if tgt_cell else "-"
-            hud_lines.append(f"#{idx} cell:({d.col},{d.row}) bat:{int(d.power.percent())}% carry:{carrying} tgt:{tgt_str} status:{ai_status}{lost_flag}")
+            hud_lines.append(
+                f"#{idx} cell:({d.col},{d.row}) bat:{int(d.power.percent())}% carry:{carrying} tgt:{tgt_str} status:{ai_status}{lost_flag}")
 
         # Reservation overview (debug): show reserved pickup cells and which AI index owns them
         if RESERVATIONS:
@@ -542,7 +578,7 @@ def run_game(initial_parcels, num_drones):
         screen.blit(hud_surf, (12, 12))
 
         # narration box: show last narration for first AI (optional)
-        narration = None
+        narration: Optional[str] = None
         if ai_controllers:
             narration = getattr(ai_controllers[0], "last_narration", None)
         if narration:

@@ -8,6 +8,7 @@ pygame-ce = "*"
 langchain = "*"
 langchain-openai = "*"
 langgraph = "*"
+langsmith = "*"
 
 [dev-packages]
 
