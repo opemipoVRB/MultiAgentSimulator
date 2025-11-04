@@ -236,7 +236,7 @@ def run_game(initial_parcels: int, num_drones: int):
     # -----------------------------
     terrain = Terrain(GRID_SIZE, (SCREEN_W, SCREEN_H), parcel_img=images["parcel_img"], parcel_scale=PARCEL_SCALE)
     terrain.spawn_random(initial_parcels)
-    print(f"Spawned {initial_parcels} parcels")
+    # print(f"Spawned {initial_parcels} parcels")
 
     # -----------------------------
     # 2) Add a delivery station in the center of the map
@@ -267,7 +267,7 @@ def run_game(initial_parcels: int, num_drones: int):
         ai = AIAgentController(drone, terrain)
         ai_controllers.append(ai)
 
-    print(f"Deployed {len(drones)} drone(s)")
+    # print(f"Deployed {len(drones)} drone(s)")
 
     # Optionally wire up an external Coordinator if present.
     COORD = None
@@ -281,7 +281,7 @@ def run_game(initial_parcels: int, num_drones: int):
         except Exception:
             # registration is best-effort
             pass
-        print("[games] Coordinator detected and registered.")
+        # print("[games] Coordinator detected and registered.")
     except Exception:
         COORD = None
 
@@ -367,6 +367,7 @@ def run_game(initial_parcels: int, num_drones: int):
             except Exception:
                 # defensive: don't let one controller crash the loop
                 print("AI controller update error", flush=True)
+
 
         # If planners are down or plans are empty, let idle AIs try greedy claim immediately.
         # This encourages concurrency: every idle AI will attempt to claim the nearest unreserved parcel.
@@ -562,7 +563,7 @@ def run_game(initial_parcels: int, num_drones: int):
         hud_lines.append("ESC to quit")
 
         # draw HUD surface
-        hud_w = int(SCREEN_W * 0.35)
+        hud_w = int(SCREEN_W * 0.4)
         hud_h = int(max(140, 26 * len(hud_lines) + 20))
         hud_surf = pygame.Surface((hud_w, hud_h), pygame.SRCALPHA)
         hud_surf.fill((245, 245, 250, 180))

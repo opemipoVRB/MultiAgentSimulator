@@ -280,6 +280,7 @@ def _call_llm_for_plan(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             return _local_plan_snapshot(snapshot)
 
     # If we get here, no LLM path was usable
+
     return _local_plan_snapshot(snapshot)
 
 

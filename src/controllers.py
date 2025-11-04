@@ -507,7 +507,7 @@ class AIAgentController(BaseAgentController):
             plan_obj = PLANNER.request_plan(snap, force_refresh=force_refresh)
         except Exception as ex:
             # Planner failed: log and keep empty plan
-            print("[PLANNER] request failed:", ex)
+            # print("[PLANNER] request failed:", ex)
             self.plan = []
             self.plan_idx = 0
             self.last_narration = None

@@ -104,12 +104,27 @@ This project aims to:
 ```
 
 src/
+├── graphics/                  # Drone and parcel sprites (visual assets)
+├── strategies/                # Coordination strategy modules
+│   ├── __init__.py
+│   ├── auction.py             # Auction-based multi-agent coordination
+│   ├── base.py                # BaseStrategy interface and abstract definitions
+│   ├── centralized_greedy.py  # Centralized greedy coordination strategy
+│   └── reservation.py         # Reservation table strategy (legacy/simple)
 │
-├── game.py                # Main simulation loop (PyGame)
-├── artifacts.py           # Terrain, Drone, Parcel, Station definitions
-├── controllers.py         # Human and AI controller logic
-├── utils.py               # Helper utilities (image scaling, loading)
-└── graphics/              # Drone and parcel sprites
+├── arbitration.py             # Deterministic scorer and assignment arbitration logic
+├── artifacts.py               # Terrain, Drone, Parcel, and Station definitions
+├── controllers.py             # Human and AI controller logic (uses Coordinator + LLM agent)
+├── coordinator.py             # High-level Coordinator and Strategy registry
+├── games.py                   # Main PyGame simulation loop and HUD rendering
+├── leader_coordinator.py      # Leader election and authoritative reservation management
+├── llm_agent.py               # Per-drone LLM wrapper with caching and rate limits
+├── llm_client.py              # Core LLM API client utilities
+├── llm_planner.py             # Planner client (LangChain/TinyLLM integration, fallback logic)
+├── proposals.py               # Proposal schema, validation, and caching utilities
+├── reservations.py            # Pluggable atomic reservation API (default in-process)
+└── utils.py                   # Shared helper utilities (image loading, scaling, math)
+
 
 ````
 

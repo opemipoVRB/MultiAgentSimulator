@@ -9,6 +9,7 @@ langchain = "*"
 langchain-openai = "*"
 langgraph = "*"
 langsmith = "*"
+dotenv = "*"
 
 [dev-packages]
 
