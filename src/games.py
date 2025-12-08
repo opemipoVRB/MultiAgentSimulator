@@ -204,15 +204,14 @@ def run_game(initial_parcels):
     terrain = Terrain(GRID_SIZE, (SCREEN_W, SCREEN_H), parcel_img=images["parcel_img"], parcel_scale=PARCEL_SCALE)
     start_col = (SCREEN_W // GRID_SIZE) // 2
     start_row = (SCREEN_H // GRID_SIZE) // 2
-    # spawn parcels based on setup entry
-    terrain.spawn_random(initial_parcels)
-
     # Add exactly one delivery station in the center with area 4x4
     cols = SCREEN_W // GRID_SIZE
     rows = SCREEN_H // GRID_SIZE
     center_col = max(2, cols // 2 - 2)
     center_row = max(2, rows // 2 - 2)
     terrain.add_station(center_col, center_row, w=4, h=4)
+    # spawn parcels based on setup entry
+    terrain.spawn_random(initial_parcels)
 
     drone = Drone((start_col, start_row), GRID_SIZE, (SCREEN_W, SCREEN_H))
 
@@ -363,13 +362,13 @@ def run_game(initial_parcels):
         # draw parcels via terrain
         terrain.draw(screen)
 
-        # draw stations (they draw a multi-cell highlighted area)
-        for s in terrain.stations:
-            # defensive draw call - some station implementations expect surf kw
-            try:
-                s.draw(surf=screen)
-            except TypeError:
-                s.draw(screen)
+        # # draw stations (they draw a multi-cell highlighted area)
+        # for s in terrain.stations:
+        #     # defensive draw call - some station implementations expect surf kw
+        #     try:
+        #         s.draw(surf=screen)
+        #     except TypeError:
+        #         s.draw(screen)
 
         # draw flash cell under drone if active
         if flash_timer > 0 and flash_cell is not None:
@@ -419,7 +418,9 @@ def run_game(initial_parcels):
         padding = 12
 
         # compute HUD height dynamically from lines (with some padding)
-        hud_h = int(SCREEN_W * 0.095)  # padding * 2 + max(len(hud_lines), 1) * line_h
+        hud_h = padding * 2 + len(hud_lines) * line_h
+
+        # hud_h = int(SCREEN_W * 0.095)  # padding * 2 + max(len(hud_lines), 1) * line_h
 
         # create translucent surface for HUD
         hud_surf = pygame.Surface((hud_w, hud_h), pygame.SRCALPHA)

@@ -4,7 +4,7 @@
 import random
 import math
 import heapq
-from typing import List, Tuple, Optional, Iterable
+from typing import List, Tuple, Optional, Iterable, Dict
 
 from collections import defaultdict, deque
 import pygame
@@ -610,13 +610,35 @@ class DeliveryStation:
         free = [c for c in cells if not terrain.occupied_cell(c[0], c[1])]
         return free
 
-    def least_used_free_cell(self, terrain) -> Optional[Tuple[int, int]]:
-        """Return the free station cell with smallest usage (deterministic). None if no free cell."""
+    def least_used_free_cell(
+        self,
+        terrain,
+        ref_col: Optional[int] = None,
+        ref_row: Optional[int] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Return the nearest free station cell to (ref_col, ref_row).
+        If ref_col/ref_row are not provided, use the station center.
+
+        Tie break order:
+          1. Smaller Manhattan distance to reference point
+          2. Lower usage count
+          3. Row, then column for deterministic ordering
+        """
         free = self.free_cells(terrain)
         if not free:
             return None
-        # sort by usage then by coordinate to have deterministic tie-break
-        free.sort(key=lambda c: (self.usage.get((c[0], c[1]), 0), c[1], c[0]))
+
+        if ref_col is None or ref_row is None:
+            ref_col = self.col + self.w // 2
+            ref_row = self.row + self.h // 2
+
+        def sort_key(c: Tuple[int, int]) -> Tuple[int, int, int, int]:
+            dist = abs(c[0] - ref_col) + abs(c[1] - ref_row)
+            usage = self.usage.get((c[0], c[1]), 0)
+            return (dist, usage, c[1], c[0])
+
+        free.sort(key=sort_key)
         return free[0]
 
     def contains_cell(self, col: int, row: int) -> bool:
@@ -660,8 +682,8 @@ class Terrain:
             self.add_parcel(c, r, weight=w)
 
     def add_parcel(self, col: int, row: int, weight: float = 1.0):
-        # only add if no (undelivered/unpicked) parcel at cell and not inside station
-        if self.parcel_at_cell(col, row) is None and not self.is_station_cell(col, row):
+        # only add if no parcel at cell at all (including delivered), and not inside station
+        if self.parcel_at_cell(col, row, include_delivered=True) is None and not self.is_station_cell(col, row):
             self.parcels.append(Parcel(col, row, self.grid_size, weight=weight))
 
     def parcel_at_cell(self, col: int, row: int, include_delivered: bool = False) -> Optional[Parcel]:
