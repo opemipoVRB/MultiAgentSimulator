@@ -19,13 +19,14 @@ USE_LLM_PLANNER = False  # flip to True when you want the LLM
 LOCAL_SEARCH_MODE = "multi"  # "greedy" or "multi"
 LOCAL_SEARCH_TRIALS = 8  # number of simulations for "multi"
 LOCAL_MAX_ITEMS = 20  # max steps in a plan
-
+LLM_BACKEND = "ollama",
 # Create planner client with explicit configuration
 PLANNER = PlannerClient(
     use_llm=USE_LLM_PLANNER,
     search_mode=LOCAL_SEARCH_MODE,
     num_trials=LOCAL_SEARCH_TRIALS,
     max_items=LOCAL_MAX_ITEMS,
+    llm_backend=LLM_BACKEND,
 )
 
 # If True, AI will attempt trips even if it cannot guarantee a return-to-base.
@@ -331,13 +332,13 @@ class AIAgentController(BaseAgentController):
 
             # Try to avoid repeating the last chosen drop if we have options
             if (
-                self._last_chosen_drop is not None
-                and self._last_chosen_drop in cells_sorted
-                and len(cells_sorted) > 1
+                    self._last_chosen_drop is not None
+                    and self._last_chosen_drop in cells_sorted
+                    and len(cells_sorted) > 1
             ):
                 cells_sorted = (
-                    [c for c in cells_sorted if c != self._last_chosen_drop]
-                    + [self._last_chosen_drop]
+                        [c for c in cells_sorted if c != self._last_chosen_drop]
+                        + [self._last_chosen_drop]
                 )
 
             return _set_and_return(cells_sorted[0])
@@ -366,8 +367,8 @@ class AIAgentController(BaseAgentController):
 
             # Prefer free cells that are not the last chosen
             if (
-                not self.terrain.occupied_cell(c, r)
-                and (c, r) != self._last_chosen_drop
+                    not self.terrain.occupied_cell(c, r)
+                    and (c, r) != self._last_chosen_drop
             ):
                 chosen = (c, r)
                 break
@@ -499,6 +500,7 @@ class AIAgentController(BaseAgentController):
                     self.drone.set_target_cell(*home)
                     self.state = "returning"
             else:
+                # Already at station or no station exists
                 self.state = "idle"
             return
 
@@ -507,37 +509,38 @@ class AIAgentController(BaseAgentController):
         # --------------------------------------------------
         time_to_replan = (now - self._last_plan_time) > self._replanning_interval
 
-        if (not self.plan or time_to_replan) and not self.drone.moving:
+        if (not self.plan or time_to_replan) and not self.drone.moving and not self.no_feasible_plan:
             self._request_plan(force_refresh=False)
 
-            # If planner returns no plan and battery is low, enter no_feasible_plan mode
+            # If planner returns no plan, enter no_feasible_plan mode once,
+            # regardless of battery, to avoid the tight loop.
             if not self.plan:
                 battery_pct = (
                     int(self.drone.power.percent())
                     if hasattr(self.drone, "power")
                     else 0
                 )
-                if battery_pct <= self._no_plan_battery_threshold:
-                    print(
-                        f"[AI] no feasible plan at battery={battery_pct}%. "
-                        f"Entering no_feasible_plan mode."
-                    )
-                    self.no_feasible_plan = True
-                    station = self.terrain.nearest_station(
+
+                # Log reason once
+                print(
+                    f"[AI] planner returned empty plan at battery={battery_pct}%. "
+                    f"Entering no_feasible_plan mode to avoid replan loop."
+                )
+
+                self.no_feasible_plan = True
+                station = self.terrain.nearest_station(self.drone.col, self.drone.row)
+                if station and not station.contains_cell(
                         self.drone.col, self.drone.row
+                ):
+                    home = (
+                        station.col + station.w // 2,
+                        station.row + station.h // 2,
                     )
-                    if station and not station.contains_cell(
-                        self.drone.col, self.drone.row
-                    ):
-                        home = (
-                            station.col + station.w // 2,
-                            station.row + station.h // 2,
-                        )
-                        self.drone.set_target_cell(*home)
-                        self.state = "returning"
-                    else:
-                        self.state = "idle"
-                    return
+                    self.drone.set_target_cell(*home)
+                    self.state = "returning"
+                else:
+                    self.state = "idle"
+                return
 
         # If drone is moving, wait till arrival
         if self.drone.moving:
@@ -601,8 +604,8 @@ class AIAgentController(BaseAgentController):
 
             # If planned_drop is occupied or equals the last chosen drop, try alternatives
             if self.terrain.occupied_cell(planned_drop[0], planned_drop[1]) or (
-                self._last_chosen_drop is not None
-                and planned_drop == self._last_chosen_drop
+                    self._last_chosen_drop is not None
+                    and planned_drop == self._last_chosen_drop
             ):
                 station_for_drop = self.terrain.nearest_station(
                     planned_drop[0], planned_drop[1]
@@ -765,7 +768,6 @@ class AIAgentController(BaseAgentController):
             self.drone.set_target_cell(pickup[0], pickup[1])
             self.state = "seeking"
             return
-
 
 
 class ControllerSwitcher:

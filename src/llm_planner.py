@@ -486,10 +486,11 @@ if LANGCHAIN_OK:
         input_variables=["snapshot", "search_mode"],
         template=_LLM_PROMPT_TEXT,
     )
-    _CHAIN = LLMChain(
-        llm=OpenAI(model="gpt-4o-mini", temperature=0.0, max_tokens=700),
-        prompt=_PROMPT,
-    )
+    _CHAIN = None
+    # _CHAIN = LLMChain(
+    #     llm=OpenAI(model="gpt-4o-mini", temperature=0.0, max_tokens=700),
+    #     prompt=_PROMPT,
+    # )
 else:
     _CHAIN = None  # type: ignore
 
@@ -766,9 +767,9 @@ class PlannerClient:
     def __init__(
         self,
         use_llm: bool = False,
-        llm_backend: str = "openai",
+        llm_backend: str = "ollama",
         ollama_model: str = DEFAULT_MODEL,
-        search_mode: str = "greedy",
+        search_mode: str = "multi",
         num_trials: int = 8,
         max_items: int = 20,
     ):
