@@ -212,9 +212,12 @@ def run_game(initial_parcels):
     terrain.add_station(center_col, center_row, w=4, h=4)
     # spawn parcels based on setup entry
     terrain.spawn_random(initial_parcels)
-
-    drone = Drone((start_col, start_row), GRID_SIZE, (SCREEN_W, SCREEN_H))
-
+    drone = Drone(
+        start_cell=(start_col, start_row),
+        grid_size=GRID_SIZE,
+        screen_size=(SCREEN_W, SCREEN_H),
+        terrain=terrain,
+    )
     # Controllers
     human = HumanAgentController(drone, terrain)
     ai = AIAgentController(drone, terrain)

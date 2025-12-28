@@ -105,12 +105,21 @@ This project aims to:
 
 src/
 │
-├── game.py                # Main simulation loop (PyGame)
-├── artifacts.py           # Terrain, Drone, Parcel, Station definitions
-├── controllers.py         # Human and AI controller logic
-├── utils.py               # Helper utilities (image scaling, loading)
-└── graphics/              # Drone and parcel sprites
-
+├─ graphics/               # Drone, parcel, station sprites
+├─ strategies/              # 🔹 Decision-making layer (NEW, core to paper)
+│   ├─ __init__.py
+│   ├─ base.py              # BaseStrategy (abstract protocol interface)
+│   ├─ centralised.py       # Centralised planner strategy
+│   ├─ decentralised_greedy.py  # Local greedy decentralised strategy
+│   ├─ naive.py             # NaiveStrategy (current behaviour refactored)
+│   └─ structured_decentralised_protocol.py  # SDPC: Structured Decentralised Protocol
+├─ artifacts.py            # Terrain, Drone, Parcel, Station definitions
+├─ controllers.py          # HumanAgentController, AIAgentController
+├─ flight_recorder.py       # Metrics, traces, trajectories, outcomes
+├─ game.py                 # Main PyGame simulation loop
+├─ run_experiment.py        # Experiment runner, batch execution, logging
+├─ utils.py                # Helper utilities (image scaling, loading, etc.)
+│
 ````
 
 ---

@@ -793,7 +793,7 @@ class PlannerClient:
         if (
             not force_refresh
             and self._last_plan
-            and (now - self._last_snapshot_ts) < 3.0
+            and (now - self._last_snapshot_ts) < 0.01
         ):
             return self._last_plan
 

@@ -1,32 +1,20 @@
 # src/controllers.py
+import os
 import pygame
 import random
 import time
 from typing import Optional, Tuple, List, Dict
 
-from llm_planner import PlannerClient
+from strategies.naive import NaiveStrategy
 
 # ---------------------------------------------------------------------------
-# Planner configuration
+# Strategy configuration (Naive decentralised baseline)
 # ---------------------------------------------------------------------------
 
-# Set to True if you want to use the LLM-based planner (when LangChain + OpenAI/Ollama
-# is configured in llm_planner). If False, only local heuristic planner is used.
-USE_LLM_PLANNER = False  # flip to True when you want the LLM
+NAIVE_NUM_TRIALS = 10  # Monte Carlo greedy rollouts per agent
 
-# Local planner behavior (these are used even if USE_LLM_PLANNER is False)
-#   search_mode: "greedy" (single pass) or "multi" (multiple simulations)
-LOCAL_SEARCH_MODE = "multi"  # "greedy" or "multi"
-LOCAL_SEARCH_TRIALS = 8  # number of simulations for "multi"
-LOCAL_MAX_ITEMS = 20  # max steps in a plan
-LLM_BACKEND = "ollama",
-# Create planner client with explicit configuration
-PLANNER = PlannerClient(
-    use_llm=USE_LLM_PLANNER,
-    search_mode=LOCAL_SEARCH_MODE,
-    num_trials=LOCAL_SEARCH_TRIALS,
-    max_items=LOCAL_MAX_ITEMS,
-    llm_backend=LLM_BACKEND,
+STRATEGY = NaiveStrategy(
+    num_trials=NAIVE_NUM_TRIALS,
 )
 
 # If True, AI will attempt trips even if it cannot guarantee a return-to-base.
@@ -44,8 +32,9 @@ class BaseAgentController:
     def handle_event(self, event):
         pass
 
-    def update(self, dt: float):
+    def update(self, dt: float, step: int, sim_time: float):
         pass
+
 
 
 class HumanAgentController(BaseAgentController):
@@ -58,7 +47,7 @@ class HumanAgentController(BaseAgentController):
     def handle_event(self, event):
         pass
 
-    def update(self, dt: float):
+    def update(self, dt: float, step: int, sim_time: float):
         keys = pygame.key.get_pressed()
         if self.drone.lost:
             return
@@ -129,8 +118,10 @@ class AIAgentController(BaseAgentController):
       - Prefers free cells inside nearest station and avoids repeating the same station cell when possible.
     """
 
-    def __init__(self, drone, terrain, search_radius: Optional[int] = None, replanning_interval: float = 4.0):
+    def __init__(self, drone, terrain, search_radius: Optional[int] = None, enable_reactive_fallback: bool = False,
+                 flight_recorder=None):
         super().__init__(drone, terrain)
+
         self.state = "idle"
         self.plan: List[Dict] = []  # each item: {"pickup": (c,r), "dropoff": (c,r), "weight": float}
         self.plan_idx: int = 0
@@ -139,11 +130,18 @@ class AIAgentController(BaseAgentController):
         self.cooldown = 0.0
         self.search_radius = search_radius
         self._last_plan_time = 0.0
-        self._replanning_interval = replanning_interval
         self._last_action_time = 0.0
         self.last_narration: Optional[str] = None
         # used to bias away from repeating the very last chosen drop cell
         self._last_chosen_drop: Optional[Tuple[int, int]] = None
+        self.parked = False
+        self.parking_in_progress = False
+        self.parking_target = None  # (col, row)
+        self.enable_reactive_fallback = enable_reactive_fallback
+        self.plan_confidence: float = 0.0
+        self.flight_recorder = flight_recorder
+
+        print(f"[INIT] AI controller for {drone.agent_id}, parked={self.parked}")
 
     # ---------------------------
     # Planner interaction
@@ -152,6 +150,7 @@ class AIAgentController(BaseAgentController):
         """Create a compact snapshot of the world state for the planner input."""
         snap = {
             "agent": {
+                "id": self.drone.agent_id,
                 "col": int(self.drone.col),
                 "row": int(self.drone.row),
                 "battery_pct": int(self.drone.power.percent()) if hasattr(self.drone, "power") else 0,
@@ -180,26 +179,44 @@ class AIAgentController(BaseAgentController):
             )
         return snap
 
-    def _request_plan(self, force_refresh: bool = False):
+    def _request_plan(self):
         """Ask PLANNER for a plan given current snapshot. Handles parsing and some truncation for narration."""
+        if self.plan:
+            return
+
         snap = self._make_snapshot()
         try:
-            plan_obj = PLANNER.request_plan(snap, force_refresh=force_refresh)
+            plan_obj = STRATEGY.request_plan(snap)
+
+            # Capture PRIOR confidence exactly once
+            if isinstance(plan_obj, dict) and plan_obj.get("plan"):
+                self.plan_confidence = float(plan_obj.get("confidence", self.plan_confidence))
+                print(
+                    f"[PLAN-PRIOR] agent={self.drone.agent_id} "
+                    f"confidence={self.plan_confidence:.3f}"
+                )
+
+            else:
+                # No plan = no belief update
+                print(
+                    f"[PLAN-PRIOR] agent={self.drone.agent_id} "
+                    f"no plan returned → confidence unchanged"
+                )
+
+
         except Exception as ex:
-            # Planner failed: log and keep empty plan
             print("[PLANNER] request failed:", ex)
             self.plan = []
             self.plan_idx = 0
             self.last_narration = None
             self._last_plan_time = time.time()
-            if not self.plan:
-                self.no_feasible_plan = True
-            else:
-                self.no_feasible_plan = False
+            self.no_feasible_plan = True
+            self.plan_confidence = 0.0
             return
 
         plan_list = plan_obj.get("plan", []) if isinstance(plan_obj, dict) else []
         parsed = []
+
         for step in plan_list:
             try:
                 pickup = (int(step["pickup"][0]), int(step["pickup"][1]))
@@ -212,8 +229,22 @@ class AIAgentController(BaseAgentController):
         self.plan = parsed
         self.plan_idx = 0
         self._last_plan_time = time.time()
+        self.no_feasible_plan = not bool(self.plan)
 
-        # narration trimming - keep it short for UI
+        # ---------------------------------------------
+        # Record initial plan (PRIOR)
+        # ---------------------------------------------
+        if self.flight_recorder and self.plan:
+            self.flight_recorder.record_initial_plan(
+                agent_id=self.drone.agent_id,
+                plan=self.plan,
+                confidence=self.plan_confidence,
+                projected_battery=plan_obj.get("projected_battery"),
+                step=0,  # first plan is pre-execution
+                sim_time=0.0,
+            )
+
+        # narration trimming for UI
         raw_n = plan_obj.get("narration", "") if isinstance(plan_obj, dict) else ""
         sentences = [s.strip() for s in raw_n.replace("\n", " ").split(".") if s.strip()]
         truncated = ". ".join(sentences[:3])
@@ -223,7 +254,6 @@ class AIAgentController(BaseAgentController):
 
         strategy = plan_obj.get("strategy", "unknown") if isinstance(plan_obj, dict) else "unknown"
 
-        # debug log so you can inspect planner decisions
         try:
             print("[PLANNER] strategy:", strategy)
             print("[PLANNER] plan received:", self.plan)
@@ -239,10 +269,121 @@ class AIAgentController(BaseAgentController):
             return self.plan[self.plan_idx]
         return None
 
-    def _advance_plan(self):
+    def _advance_plan(self, *, step: int, sim_time: float):
+        """
+        Advance the current plan step.
+
+        If reactive fallback is enabled, attempt to locally replace the
+        current step with a feasible alternative before advancing.
+        """
+
+        if self.enable_reactive_fallback:
+            progress = {
+                "current_cell": (int(self.drone.col), int(self.drone.row)),
+                "battery_pct": float(self.drone.power.percent()),
+                "attempted_parcels": set(),
+                "failed_parcels": set(),
+            }
+
+            # Snapshot the station (planner must never see live objects)
+            station_obj = self.terrain.nearest_station(self.drone.col, self.drone.row)
+            station = None
+            if station_obj:
+                station = {
+                    "col": int(station_obj.col),
+                    "row": int(station_obj.row),
+                    "w": int(station_obj.w),
+                    "h": int(station_obj.h),
+                }
+
+            next_choice = STRATEGY.choose_best_feasible_next_parcel(
+                progress=progress,
+                parcels=[
+                    {
+                        "id": getattr(p, "id", None),
+                        "col": p.col,
+                        "row": p.row,
+                        "weight": getattr(p, "weight", 1.0),
+                        "picked": getattr(p, "picked", False),
+                        "delivered": getattr(p, "delivered", False),
+                    }
+                    for p in self.terrain.parcels
+                ],
+                station=station,
+                known_weight=True,
+            )
+
+            if next_choice:
+                old_step = self.plan[self.plan_idx]
+
+                self.plan[self.plan_idx] = {
+                    "pickup": tuple(next_choice["pickup"]),
+                    "dropoff": tuple(next_choice["dropoff"]),
+                    "weight": next_choice["weight"],
+                }
+
+                # ---------------------------------------------
+                # Posterior confidence update (belief revision)
+                # ---------------------------------------------
+                evidence = next_choice.get("posterior_evidence")
+                if evidence is not None:
+                    prior = self.plan_confidence
+
+                    modifier = STRATEGY.compute_posterior_confidence_modifier(
+                        prior_confidence=prior,
+                        evidence=evidence,
+                    )
+
+                    posterior = prior * modifier
+                    self.plan_confidence = posterior
+
+                    if self.flight_recorder:
+                        # 1) Log structural change FIRST
+                        self.flight_recorder.record_plan_change(
+                            agent_id=self.drone.agent_id,
+                            old_step=old_step,
+                            new_step=self.plan[self.plan_idx],
+                            estimated_cost=next_choice.get("estimated_cost"),
+                            battery_before=progress["battery_pct"],
+                            battery_after=self.drone.power.percent(),
+                            prior_confidence=prior,
+                            posterior_confidence=posterior,
+                            reason="reactive_fallback",
+                            step=step,
+                            sim_time=sim_time,
+                        )
+
+                        # 2) Then log belief evolution
+                        self.flight_recorder.record_confidence_update(
+                            agent_id=self.drone.agent_id,
+                            confidence=posterior,
+                            modifier=modifier,
+                            note="reactive_fallback_confidence_revision",
+                            step=step,
+                            sim_time=sim_time,
+                        )
+
+                    print(
+                        f"[CONFIDENCE-UPDATE] agent={self.drone.agent_id} "
+                        f"{prior:.3f} → {self.plan_confidence:.3f}"
+                    )
+
+                print(
+                    f"[REACTIVE-FALLBACK] agent={self.drone.agent_id} "
+                    f"at={progress['current_cell']} "
+                    f"battery={progress['battery_pct']:.1f}%\n"
+                    f"  replaced pickup {old_step['pickup']} → {next_choice['pickup']} "
+                    f"drop {old_step['dropoff']} → {next_choice['dropoff']}"
+                )
+
+                return  # do not advance index
+
+        # ---------------------------------------------
+        # Normal plan advancement
+        # ---------------------------------------------
         self.plan_idx += 1
+
         if self.plan_idx >= len(self.plan):
-            # plan exhausted
             self.plan = []
             self.plan_idx = 0
             self.state = "idle"
@@ -274,6 +415,39 @@ class AIAgentController(BaseAgentController):
         # If we allow risky trips, do not force a margin for return; just require energy >= needed.
         return self.drone.power.level >= needed
 
+    def _request_parking(self) -> Optional[Tuple[int, int]]:
+        station = self.terrain.nearest_station(self.drone.col, self.drone.row)
+        if not station:
+            return None
+        return station.park_drone(self.drone)
+
+    def _begin_parking(self):
+        """
+        Request a parking allocation from the nearest station and, if granted,
+        initiate movement toward the allocated cell.
+
+        This method does NOT search for free cells or validate occupancy.
+        Parking allocation is authoritative and owned by DeliveryStation.
+        """
+        if self.parking_in_progress or self.parked:
+            return
+
+        cell = self._request_parking()
+        if cell is None:
+            # No parking available yet
+            return
+
+        self.parking_target = cell
+        self.parking_in_progress = True
+
+        self.drone.set_target_cell(cell[0], cell[1])
+
+        print(
+            f"[PARK-START] agent={self.drone.agent_id} "
+            f"from=({self.drone.col},{self.drone.row}) "
+            f"to={cell}"
+        )
+
     # ---------------------------
     # Delivery cell chooser
     # ---------------------------
@@ -293,6 +467,25 @@ class AIAgentController(BaseAgentController):
         station = self.terrain.nearest_station(self.drone.col, self.drone.row)
 
         def _set_and_return(cell: Tuple[int, int]) -> Tuple[int, int]:
+            if station:
+                print(
+                    f"[STATION STATE @ PARK DECISION] agent={self.drone.agent_id} "
+                    f"{station.debug_state()}"
+                )
+                print(
+                    f"[PARKING] agent={self.drone.agent_id} "
+                    f"target_cell={cell} "
+                    f"station=({station.col},{station.row}) "
+                    f"occupied={self.terrain.occupied_cell(cell[0], cell[1])}"
+                )
+            else:
+                print(
+                    f"[PARKING] agent={self.drone.agent_id} "
+                    f"target_cell={cell} "
+                    f"station=None "
+                    f"occupied={self.terrain.occupied_cell(cell[0], cell[1])}"
+                )
+
             self._last_chosen_drop = cell
             return cell
 
@@ -388,8 +581,10 @@ class AIAgentController(BaseAgentController):
     # ---------------------------
     # Main update loop
     # ---------------------------
-    def update(self, dt: float):
-        # cooldown timer
+    def update(self, dt: float, step: int, sim_time: float):
+        # -----------------------------------------------
+        # Cooldown + hard stop conditions
+        # -----------------------------------------------
         if self.cooldown > 0:
             self.cooldown -= dt
 
@@ -398,300 +593,118 @@ class AIAgentController(BaseAgentController):
 
         now = time.time()
 
-        # --------------------------------------------------
-        # Local immediate actions when not moving
-        # --------------------------------------------------
+        # -----------------------------------------------
+        # Parking completion check (arrival-based)
+        # -----------------------------------------------
+        if self.parking_in_progress:
+            if not self.drone.moving:
+                self.parking_in_progress = False
+                self.parked = True
+                print(
+                    f"[PARKED] agent={self.drone.agent_id} "
+                    f"cell=({self.drone.col},{self.drone.row}) "
+                    f"battery={int(self.drone.power.percent())}%"
+                )
+            return
+
+        # -----------------------------------------------
+        # Immediate local actions when NOT moving
+        # -----------------------------------------------
         if not self.drone.moving:
-            # 1) Not carrying -> try to pick if parcel is here
+
+            # --------------------------------------------------
+            # 1) Not carrying → attempt pick if parcel is here
+            # --------------------------------------------------
             if self.drone.carrying is None:
                 p_here = self.terrain.parcel_at_cell(self.drone.col, self.drone.row)
                 if p_here:
-                    print(
-                        f"[AI] arrived at parcel cell {(self.drone.col, self.drone.row)} "
-                        f"- attempting pick (battery={int(self.drone.power.percent())}%)"
-                    )
                     success = self.drone.perform_pick(p_here)
                     if not success:
-                        # Pick failed, go to nearest station
                         self.drone._last_action = (
                             "pick_failed",
                             (self.drone.col, self.drone.row),
                             None,
                         )
-                        station = self.terrain.nearest_station(
-                            self.drone.col, self.drone.row
-                        )
-                        if station:
-                            home = (
-                                station.col + station.w // 2,
-                                station.row + station.h // 2,
-                            )
-                            self.drone.set_target_cell(*home)
-                            self.state = "returning"
-                        return
                     else:
                         self.state = "carrying"
                         self._last_action_time = now
-                        return
+                    return
 
-            else:
-                # 2) Carrying -> if inside station, try to drop immediately or move
-                #    only to the nearest free station cell.
-                station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-                if station and station.contains_cell(self.drone.col, self.drone.row):
-                    # If this cell is free, drop here
-                    if not self.terrain.occupied_cell(self.drone.col, self.drone.row):
-                        print(
-                            f"[AI] arrived at station cell {(self.drone.col, self.drone.row)} "
-                            f"- attempting drop (battery={int(self.drone.power.percent())}%)"
-                        )
-                        parcel_ref = self.drone.carrying
-                        self.drone.perform_drop(parcel_ref)
-                        self._last_chosen_drop = (self.drone.col, self.drone.row)
-
-                        # Treat the plan dropoff as satisfied if it is in the same station
-                        step = self._current_step()
-                        if step:
-                            planned_drop = tuple(step["dropoff"])
-                            station_for_plan = self.terrain.nearest_station(
-                                planned_drop[0], planned_drop[1]
-                            )
-                            if station_for_plan and station_for_plan is station:
-                                self._advance_plan()
-                        return
-                    else:
-                        # Current station cell is occupied, so move to the nearest free cell
-                        alt = None
-                        try:
-                            alt = station.least_used_free_cell(
-                                self.terrain,
-                                ref_col=self.drone.col,
-                                ref_row=self.drone.row,
-                            )
-                        except Exception:
-                            alt = None
-
-                        if alt is None:
-                            # Fallback to global chooser if station helper failed
-                            try:
-                                alt = self._choose_delivery_cell()
-                            except Exception:
-                                alt = None
-
-                        if alt and not self.drone.moving:
-                            self.drone.set_target_cell(alt[0], alt[1])
-                            self.state = "returning"
-                        else:
-                            # No alternative free cell found, just mark idle inside station
-                            self.state = "idle"
-                        return
-
-        # --------------------------------------------------
-        # Handle "no feasible plan" mode to avoid looping
-        # --------------------------------------------------
-        if self.no_feasible_plan:
+            # --------------------------------------------------
+            # 2) Carrying → attempt drop if inside station
+            # --------------------------------------------------
             station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-            if station and not station.contains_cell(self.drone.col, self.drone.row):
-                if not self.drone.moving:
-                    home = (
-                        station.col + station.w // 2,
-                        station.row + station.h // 2,
-                    )
-                    self.drone.set_target_cell(*home)
-                    self.state = "returning"
-            else:
-                # Already at station or no station exists
-                self.state = "idle"
-            return
+            if (
+                    self.drone.carrying
+                    and station
+                    and station.contains_cell(self.drone.col, self.drone.row)
+            ):
+                parcel_ref = self.drone.carrying
+                success = self.drone.perform_drop(parcel_ref)
 
-        # --------------------------------------------------
-        # Request plan if none or time to replan
-        # --------------------------------------------------
-        time_to_replan = (now - self._last_plan_time) > self._replanning_interval
+                if success:
+                    self._last_chosen_drop = (self.drone.col, self.drone.row)
 
-        if (not self.plan or time_to_replan) and not self.drone.moving and not self.no_feasible_plan:
-            self._request_plan(force_refresh=False)
-
-            # If planner returns no plan, enter no_feasible_plan mode once,
-            # regardless of battery, to avoid the tight loop.
-            if not self.plan:
-                battery_pct = (
-                    int(self.drone.power.percent())
-                    if hasattr(self.drone, "power")
-                    else 0
-                )
-
-                # Log reason once
-                print(
-                    f"[AI] planner returned empty plan at battery={battery_pct}%. "
-                    f"Entering no_feasible_plan mode to avoid replan loop."
-                )
-
-                self.no_feasible_plan = True
-                station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-                if station and not station.contains_cell(
-                        self.drone.col, self.drone.row
-                ):
-                    home = (
-                        station.col + station.w // 2,
-                        station.row + station.h // 2,
-                    )
-                    self.drone.set_target_cell(*home)
-                    self.state = "returning"
+                    step = self._current_step()
+                    if step:
+                        self._advance_plan(step=step, sim_time=sim_time)
                 else:
-                    self.state = "idle"
-                return
-
-        # If drone is moving, wait till arrival
-        if self.drone.moving:
-            return
-
-        # --------------------------------------------------
-        # Carrying branch: follow or adapt planned dropoff
-        # --------------------------------------------------
-        if self.drone.carrying:
-            step = self._current_step()
-
-            # Decide which station we are targeting from the plan, if any.
-            target_station = None
-            planned_drop = (self.drone.col, self.drone.row)
-
-            if step:
-                plan_drop = tuple(step["dropoff"])
-                target_station = self.terrain.nearest_station(
-                    plan_drop[0], plan_drop[1]
-                )
-
-            if target_station is None:
-                target_station = self.terrain.nearest_station(
-                    self.drone.col, self.drone.row
-                )
-
-            if target_station:
-                # Always choose the nearest free cell in that station,
-                # relative to current drone position.
-                try:
-                    nearest_free = target_station.least_used_free_cell(
+                    alt = station.least_used_free_cell(
                         self.terrain,
                         ref_col=self.drone.col,
                         ref_row=self.drone.row,
                     )
-                except Exception:
-                    nearest_free = None
-
-                if nearest_free is not None:
-                    planned_drop = nearest_free
-                else:
-                    # No free cell in this station  fall back to nearest station cell
-                    cells = [
-                        (c, r)
-                        for r in range(target_station.row, target_station.row + target_station.h)
-                        for c in range(target_station.col, target_station.col + target_station.w)
-                    ]
-                    cells.sort(
-                        key=lambda c: (
-                            abs(c[0] - self.drone.col)
-                            + abs(c[1] - self.drone.row),
-                            c[1],
-                            c[0],
-                        )
-                    )
-                    if cells:
-                        planned_drop = cells[0]
-            else:
-                # No station at all  keep current position as drop
-                planned_drop = (self.drone.col, self.drone.row)
-
-            # If planned_drop is occupied or equals the last chosen drop, try alternatives
-            if self.terrain.occupied_cell(planned_drop[0], planned_drop[1]) or (
-                    self._last_chosen_drop is not None
-                    and planned_drop == self._last_chosen_drop
-            ):
-                station_for_drop = self.terrain.nearest_station(
-                    planned_drop[0], planned_drop[1]
-                )
-                if station_for_drop:
-                    try:
-                        alt = station_for_drop.least_used_free_cell(
-                            self.terrain,
-                            ref_col=self.drone.col,
-                            ref_row=self.drone.row,
-                        )
-                    except Exception:
-                        alt = None
                     if alt:
-                        planned_drop = alt
-                    else:
-                        planned_drop = self._choose_delivery_cell()
-                else:
-                    planned_drop = self._choose_delivery_cell()
+                        self.drone.set_target_cell(*alt)
+                return
+        # -----------------------------------------------
+        # Request plan exactly once (open-loop)
+        # -----------------------------------------------
+        if not self.plan and not self.no_feasible_plan:
 
-            # Check energy for route to planned_drop
-            enough = self._ensure_energy_for_route(
-                (self.drone.col, self.drone.row),
-                planned_drop,
-                carry_weight=getattr(self.drone.carrying, "weight", 0.0),
-                require_return=(not ALLOW_RISKY_TRIPS),
-            )
+            # mission-complete short-circuit
+            if not self.terrain.has_undelivered_parcels():
+                self.no_feasible_plan = True
+                return
 
-            if not enough:
-                if not ALLOW_RISKY_TRIPS:
-                    station = self.terrain.nearest_station(
-                        self.drone.col, self.drone.row
-                    )
-                    if station:
-                        home = (
-                            station.col + station.w // 2,
-                            station.row + station.h // 2,
-                        )
-                        self.drone.set_target_cell(*home)
-                        self.state = "returning"
-                        return
-                    else:
-                        self.drone.lost = True
-                        return
-                else:
-                    if not self.drone.moving:
+            self._request_plan()
+
+            if not self.plan:
+                self.no_feasible_plan = True
+                return
+        # -----------------------------------------------
+        # Handle NO FEASIBLE PLAN → REQUEST PARKING
+        # -----------------------------------------------
+        if self.no_feasible_plan:
+            if not self.parked and not self.parking_in_progress:
+                station = self.terrain.nearest_station(self.drone.col, self.drone.row)
+                if station:
+                    cell = station.park_drone(self.drone)
+                    if cell:
+                        self.parking_in_progress = True
+                        self.drone.set_target_cell(*cell)
                         print(
-                            f"[PLANNER] attempting risky drop to {planned_drop} "
-                            f"battery={int(self.drone.power.percent())}%"
+                            f"[PARK-REQUEST] agent={self.drone.agent_id} "
+                            f"assigned_cell={cell}"
                         )
-                        self.drone.set_target_cell(planned_drop[0], planned_drop[1])
-                    return
-
-            # If already at planned drop cell, try to drop if free
-            if (self.drone.col, self.drone.row) == planned_drop:
-                if not self.terrain.occupied_cell(planned_drop[0], planned_drop[1]):
-                    parcel_ref = self.drone.carrying
-                    self.drone.perform_drop(parcel_ref)
-                    self._last_chosen_drop = planned_drop
-
-                    step = self._current_step()
-                    if step:
-                        plan_drop = tuple(step["dropoff"])
-                        st_plan = self.terrain.nearest_station(
-                            plan_drop[0], plan_drop[1]
-                        )
-                        st_here = self.terrain.nearest_station(
-                            planned_drop[0], planned_drop[1]
-                        )
-                        # If this drop is in the same station as the plan, the step is satisfied
-                        if st_plan and st_here and st_plan is st_here:
-                            self._advance_plan()
-                    return
-                else:
-                    # The cell is occupied, replan drop target
-                    self._request_plan(force_refresh=True)
-                    return
-
-            # Move towards planned drop cell
-            if not self.drone.moving:
-                self.drone.set_target_cell(planned_drop[0], planned_drop[1])
             return
 
-        # --------------------------------------------------
-        # Not carrying: follow pickup steps in the plan
-        # --------------------------------------------------
+        if self.drone.moving:
+            return
+
+        # -----------------------------------------------
+        # Carrying → follow drop intent
+        # -----------------------------------------------
+        if self.drone.carrying:
+            step = self._current_step()
+            if step:
+                drop_cell = tuple(step["dropoff"])
+                self.drone.set_target_cell(*drop_cell)
+            return
+
+        # -----------------------------------------------
+        # Not carrying → follow pickup intent
+        # -----------------------------------------------
         step = self._current_step()
         if not step:
             self.state = "idle"
@@ -700,74 +713,12 @@ class AIAgentController(BaseAgentController):
         pickup = tuple(step["pickup"])
         pobj = self.terrain.parcel_at_cell(pickup[0], pickup[1])
 
-        # Parcel no longer available, advance plan
         if pobj is None or getattr(pobj, "delivered", False):
-            self._advance_plan()
-            if (now - self._last_plan_time) > self._replanning_interval:
-                self._request_plan(force_refresh=True)
+            self._advance_plan(step=step, sim_time=sim_time)
             return
 
-        dropoff = tuple(step["dropoff"])
-
-        # Check reachability
-        can_reach_pick = self._ensure_energy_for_route(
-            (self.drone.col, self.drone.row),
-            pickup,
-            carry_weight=0.0,
-            require_return=False,
-        )
-        can_reach_after_pick = self._ensure_energy_for_route(
-            pickup,
-            dropoff,
-            carry_weight=step.get("weight", 1.0),
-            require_return=(not ALLOW_RISKY_TRIPS),
-        )
-
-        if not (can_reach_pick and can_reach_after_pick):
-            station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-            if station and not ALLOW_RISKY_TRIPS:
-                home = (station.col + station.w // 2, station.row + station.h // 2)
-                self.drone.set_target_cell(*home)
-                self.state = "returning"
-                return
-            else:
-                if ALLOW_RISKY_TRIPS:
-                    if not self.drone.moving:
-                        print(
-                            f"[PLANNER] attempting risky pickup at {pickup} "
-                            f"battery={int(self.drone.power.percent())}%"
-                        )
-                        self.drone.set_target_cell(pickup[0], pickup[1])
-                    return
-                else:
-                    self._request_plan(force_refresh=True)
-                    return
-
-        # If at pickup cell, perform pick
-        if (self.drone.col, self.drone.row) == pickup:
-            success = self.drone.perform_pick(pobj)
-            if success:
-                self.state = "carrying"
-                self._last_action_time = now
-                return
-            else:
-                station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-                if station:
-                    home = (station.col + station.w // 2, station.row + station.h // 2)
-                    self.drone.set_target_cell(*home)
-                    return
-                else:
-                    self.drone.lost = True
-                    return
-
-        # Otherwise set target to pickup
-        if not self.drone.moving:
-            if pobj.picked or getattr(pobj, "delivered", False):
-                self._advance_plan()
-                return
-            self.drone.set_target_cell(pickup[0], pickup[1])
-            self.state = "seeking"
-            return
+        self.drone.set_target_cell(*pickup)
+        self.state = "seeking"
 
 
 class ControllerSwitcher:
@@ -788,5 +739,6 @@ class ControllerSwitcher:
         else:
             self.current.handle_event(event)
 
-    def update(self, dt: float):
-        self.current.update(dt)
+    def update(self, dt: float, step: int, sim_time: float):
+        self.current.update(dt, step, sim_time)
+
