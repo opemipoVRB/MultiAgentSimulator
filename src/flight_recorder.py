@@ -45,7 +45,7 @@ class FlightRecorder:
 
     - Explicit time semantics:
       Every recorded event includes:
-        * simulation step (discrete)
+        * simulation step (discrfor pdef in self.experiment.get("parcels", []):ete)
         * simulation time (continuous)
         * wall-clock time (real-world)
 
@@ -66,7 +66,7 @@ class FlightRecorder:
         run_id: str,
         planner: str,
         agents: List[Dict],
-        parcels: List[Dict],
+        parcels: List[Dict[str, any]],
         grid_size: int,
         dt: float = 1.0,
         sim_dt: Optional[float] = None,
@@ -89,7 +89,7 @@ class FlightRecorder:
 
                     parcels:
                         Parcel definitions from the experiment schema.
-                        Each parcel must have a stable ID and spawn location so that
+                        Each parcel must have a stable ID (string) and spawn location so that
                         contention and delivery can be tracked consistently.
 
                     grid_size:
@@ -141,8 +141,9 @@ class FlightRecorder:
         # ==================================================
         self.parcels: Dict[int, Dict] = {}
         for p in parcels:
-            self.parcels[p["id"]] = {
-                "parcel_id": p["id"],
+            parcel_id = str(p["id"])  # Convert to string
+            self.parcels[parcel_id] = {
+                "parcel_id": parcel_id,  # Store as string
                 "spawn_cell": (p["col"], p["row"]),
                 "picked_by": None,
                 "picked_at": None,
@@ -160,9 +161,156 @@ class FlightRecorder:
         # Internal trackers
         # ==================================================
         self._last_cell: Dict[str, Tuple[int, int]] = {}
-        self._parcel_targets = defaultdict(set)
-        self._parcel_chase_start = defaultdict(dict)
+        self._parcel_targets: Dict[str, set] = defaultdict(set)
+        self._parcel_chase_start: Dict[str, Dict[str, int]] = defaultdict(dict)
         self._cell_visits = defaultdict(int)
+
+    def reconstruct_from_snapshot(self, snapshot: Dict):
+        """
+        Reconstruct flight recorder history from a snapshot.
+        This creates fake events for actions that happened before the snapshot.
+        """
+        snapshot_step = snapshot.get("steps", 0)
+        snapshot_time = snapshot_step * self.dt  # Convert to simulation time
+
+        print(f"[FLIGHT-RECORDER] Reconstructing history from snapshot at step {snapshot_step}")
+
+        # Process each parcel from the snapshot
+        for ps in snapshot.get("parcels", []):
+            parcel_id = ps.get("id")
+            if not parcel_id:
+                continue
+
+            picked = bool(ps.get("picked", False))
+            delivered = bool(ps.get("delivered", False))
+            spawn_cell = (int(ps["col"]), int(ps["row"]))
+
+            # Create parcel record
+            self.parcels[parcel_id] = {
+                "parcel_id": parcel_id,
+                "spawn_cell": spawn_cell,
+                "picked_by": None,
+                "picked_at": None,
+                "delivered_by": None,
+                "delivered_at": None,
+                "pick_attempts": [],
+            }
+
+            # Reconstruct timeline
+            if delivered:
+                # Parcel was delivered at or before snapshot time
+                # We'll assume it was delivered at the snapshot time
+                delivery_step = snapshot_step
+                delivery_time = snapshot_time
+
+                # It must have been picked before delivery
+                pick_step = max(0, snapshot_step - 10)  # Assume picked 10 steps before
+                pick_time = pick_step * self.dt
+
+                # Record the pick (fake event)
+                pick_event = {
+                    "type": "pick",
+                    "cell": spawn_cell,
+                    "parcel_id": parcel_id,
+                    "time": {
+                        "step": pick_step,
+                        "sim_time": pick_time,
+                        "world_time": self.started_at + pick_time,
+                    }
+                }
+
+                # Record the delivery (fake event)
+                delivery_event = {
+                    "type": "drop",
+                    "cell": spawn_cell,  # Delivery location (might be different in reality)
+                    "parcel_id": parcel_id,
+                    "time": {
+                        "step": delivery_step,
+                        "sim_time": delivery_time,
+                        "world_time": self.started_at + delivery_time,
+                    }
+                }
+
+                # Update parcel record
+                self.parcels[parcel_id]["picked_by"] = "snapshot_reconstructed"
+                self.parcels[parcel_id]["picked_at"] = pick_time
+                self.parcels[parcel_id]["delivered_by"] = "snapshot_reconstructed"
+                self.parcels[parcel_id]["delivered_at"] = delivery_time
+                self.parcels[parcel_id]["pick_attempts"].append(pick_event)
+
+                # Also add to some agent's task list (we don't know which agent)
+                # We'll pick the first agent as a placeholder
+                if self.agents:
+                    first_agent = list(self.agents.keys())[0]
+                    self.agents[first_agent]["tasks"].append({
+                        "parcel_id": parcel_id,
+                        "time": delivery_event["time"],
+                    })
+
+                print(f"[FLIGHT-RECORDER] Reconstructed: Parcel {parcel_id} delivered at step {delivery_step}")
+
+            elif picked and not delivered:
+                # Parcel was picked but not delivered at snapshot time
+                # This is a tricky case - the parcel should be with an agent
+                print(f"[FLIGHT-RECORDER] WARNING: Parcel {parcel_id} is picked but not delivered in snapshot")
+    # ======================================================
+    # Register Parcel
+    # ======================================================
+    def register_parcel(self, parcel, step: int = 0, sim_time: float = 0.0,
+                        is_from_snapshot: bool = False, snapshot_step: int = 0):
+        """
+        Register a parcel in the flight recorder.
+
+        Args:
+            parcel: The Parcel object
+            step: Current simulation step
+            sim_time: Current simulation time
+            is_from_snapshot: Whether this parcel is from a restored snapshot
+            snapshot_step: The step at which the snapshot was taken
+        """
+        parcel_id = getattr(parcel, "id", None)
+        if parcel_id and parcel_id not in self.parcels:
+            picked = getattr(parcel, "picked", False)
+            delivered = getattr(parcel, "delivered", False)
+
+            parcel_data = {
+                "parcel_id": parcel_id,
+                "spawn_cell": (int(parcel.col), int(parcel.row)),
+                "picked_by": None,
+                "picked_at": None,
+                "delivered_by": None,
+                "delivered_at": None,
+                "pick_attempts": [],
+                "metadata": {
+                    "registered_at": time.time(),
+                    "from_snapshot": is_from_snapshot,
+                    "snapshot_step": snapshot_step if is_from_snapshot else None,
+                    "initial_state": {
+                        "picked": picked,
+                        "delivered": delivered
+                    }
+                }
+            }
+
+            # If parcel is from a snapshot and already delivered,
+            # we need to record it as delivered in the past
+            if is_from_snapshot and delivered:
+                # Mark as delivered at the snapshot time (or slightly before)
+                # Use "unknown_snapshot" to indicate we don't know which agent
+                parcel_data["delivered_by"] = "unknown_snapshot"
+                parcel_data["delivered_at"] = sim_time
+
+                # If it was picked before delivery (it must have been)
+                if picked:
+                    parcel_data["picked_by"] = "unknown_snapshot"
+                    # Estimate pick time as slightly before delivery
+                    parcel_data["picked_at"] = sim_time - 1.0  # 1 second before delivery
+
+                print(
+                    f"[FLIGHT-RECORDER] Registered PRE-DELIVERED parcel {parcel_id} from snapshot (step {snapshot_step})")
+
+            self.parcels[parcel_id] = parcel_data
+            print(f"[FLIGHT-RECORDER] Registered parcel {parcel_id}")
 
     # ======================================================
     # Per-step observation (preferred entry point)
@@ -224,14 +372,14 @@ class FlightRecorder:
     # Action-level logging
     # ======================================================
     def record_action(
-        self,
-        agent_id: str,
-        kind: str,
-        cell: Tuple[int, int],
-        parcel,
-        step: int,
-        sim_time: float,
-        world_time: Optional[float] = None,
+            self,
+            agent_id: str,
+            kind: str,
+            cell: Tuple[int, int],
+            parcel,
+            step: int,
+            sim_time: float,
+            world_time: Optional[float] = None,
     ):
         """
         Record a discrete agent action.
@@ -251,6 +399,19 @@ class FlightRecorder:
         parcel_id = getattr(parcel, "id", None)
         if parcel_id is not None:
             entry["parcel_id"] = parcel_id
+
+            # Ensure the parcel is registered in our tracker
+            if parcel_id not in self.parcels:
+                # Register this parcel on first encounter
+                self.parcels[parcel_id] = {
+                    "parcel_id": parcel_id,
+                    "spawn_cell": (int(parcel.col), int(parcel.row)),
+                    "picked_by": None,
+                    "picked_at": None,
+                    "delivered_by": None,
+                    "delivered_at": None,
+                    "pick_attempts": [],
+                }
 
         self.agents[agent_id]["actions"].append(entry)
 
@@ -297,7 +458,7 @@ class FlightRecorder:
     # ======================================================
     # Contention and inefficiency detection
     # ======================================================
-    def _resolve_parcel(self, parcel_id: int, winner: str, step: int, sim_time: float):
+    def _resolve_parcel(self, parcel_id: str, winner: str, step: int, sim_time: float):  # Change int to str
         contenders = self._parcel_targets.get(parcel_id, set())
         if len(contenders) > 1:
             losers = [a for a in contenders if a != winner]
@@ -322,7 +483,7 @@ class FlightRecorder:
         self._parcel_targets.pop(parcel_id, None)
         self._parcel_chase_start.pop(parcel_id, None)
 
-    def _abort_chase(self, parcel_id: int, agent_id: str, step: int, sim_time: float):
+    def _abort_chase(self, parcel_id: str, agent_id: str, step: int, sim_time: float):  # Change int to str
         if parcel_id in self._parcel_targets:
             self._parcel_targets[parcel_id].discard(agent_id)
             start = self._parcel_chase_start.get(parcel_id, {}).get(agent_id)
@@ -344,14 +505,14 @@ class FlightRecorder:
                 data["final_battery"] = data["energy"][-1]["battery_pct"]
 
     def export(self) -> Dict:
-        """
-        Export a fully self-contained flight manifest.
-        """
         self.finalize()
+
         return {
-            "run_id": self.run_id,
-            "planner": self.planner,
-            "started_at": self.started_at,
+            "meta": {
+                "run_id": self.run_id,
+                "planner": self.planner,
+                "started_at": self.started_at,
+            },
             "agents": list(self.agents.values()),
             "parcels": list(self.parcels.values()),
             "fleet_events": self.fleet_events,

@@ -36,7 +36,6 @@ class BaseAgentController:
         pass
 
 
-
 class HumanAgentController(BaseAgentController):
     """Manual control for the drone (keyboard)."""
 
@@ -77,11 +76,13 @@ class HumanAgentController(BaseAgentController):
                     home_col, home_row = self.drone.col, self.drone.row
 
                 # The human controller still uses a conservative check
-                if hasattr(self.drone, "can_reach_and_return") and not self.drone.can_reach_and_return(
-                        new_col, new_row, home_col, home_row
-                ):
-                    # insufficient energy for that move + return -> send home instead
-                    self.drone.set_target_cell(home_col, home_row)
+                if callable(getattr(self.drone, "can_reach_and_return", None)):
+                    if not self.drone.can_reach_and_return(
+                            new_col, new_row, home_col, home_row
+                    ):
+                        self.drone.set_target_cell(home_col, home_row)
+                    else:
+                        self.drone.set_target_cell(new_col, new_row)
                 else:
                     self.drone.set_target_cell(new_col, new_row)
 
@@ -741,4 +742,3 @@ class ControllerSwitcher:
 
     def update(self, dt: float, step: int, sim_time: float):
         self.current.update(dt, step, sim_time)
-

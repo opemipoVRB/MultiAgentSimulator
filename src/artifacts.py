@@ -1,60 +1,18 @@
 # src/artifacts.py
-
-
 import random
 import math
 import heapq
 from typing import List, Tuple, Optional, Iterable, Dict
-
+from resources import PowerResource, NetworkResource
 from collections import defaultdict, deque
 import pygame
-
-
-# -------------------------
-# Resource classes
-# -------------------------
-class AgentResource:
-    """Base resource class for agents (Power, Network, ...)."""
-
-    def __init__(self, capacity: float):
-        self.capacity = float(capacity)
-        self.level = float(capacity)
-
-    def percent(self) -> float:
-        if self.capacity <= 0:
-            return 0.0
-        return max(0.0, min(100.0, (self.level / self.capacity) * 100.0))
-
-    def is_depleted(self) -> bool:
-        return self.level <= 0.0
-
-    def recharge(self, amount: float):
-        self.level = min(self.capacity, self.level + float(amount))
-
-    def consume(self, amount: float):
-        """Consume amount (not percent). Negative values will recharge."""
-        self.level -= float(amount)
-        if self.level < 0.0:
-            self.level = 0.0
-
-
-class PowerResource(AgentResource):
-    """Power resource measured in 'energy units'. Default capacity = 100."""
-
-    def __init__(self, capacity: float = 100.0):
-        super().__init__(capacity)
-
-
-class NetworkResource(AgentResource):
-    """Placeholder for future network/signal modeling."""
-
-    def __init__(self, capacity: float = 100.0):
-        super().__init__(capacity)
-
+import uuid
 
 # -------------------------
 # World artifacts
 # -------------------------
+
+
 class Parcel:
     def __init__(self, col: int, row: int, grid_size: int):
         """
@@ -73,6 +31,7 @@ class Parcel:
         self.picked = False
         self.delivered = False
         self.weight = self._sample_weight()
+        self.id = str(uuid.uuid4())[:8]
 
     # -------------------------
     # Physical presence helpers

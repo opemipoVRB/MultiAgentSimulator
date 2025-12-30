@@ -25,7 +25,6 @@ from artifacts import Terrain, Drone, Parcel
 from controllers import HumanAgentController, AIAgentController, ControllerSwitcher
 from utils import load_image, scale_to_cell
 
-# Visual parity settings from games.py
 GRID_SIZE = 100
 SPEED = 420
 DRONE_SCALE = 1.25
@@ -168,6 +167,7 @@ class ExperimentRunnerGUI:
         self.planners = ["local"]
         self.run_id = str(uuid.uuid4())[:8]
         self.experiment: Dict = {}
+        self.experiment_dir: Optional[Path] = None
         self.experiment_json_path: Optional[Path] = None
 
         # communication config (placeholder)
@@ -447,15 +447,60 @@ class ExperimentRunnerGUI:
         }
 
     def _find_recent_experiment(self) -> Optional[Path]:
-        # prefer unfinished temp_* first that match seed/parcels, else most recent experiment_*
-        candidates = sorted(EXPERIMENTS_DIR.glob("temp_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if candidates:
-            return candidates[0]
-        candidates2 = sorted(EXPERIMENTS_DIR.glob(f"{EXPERIMENT_PREFIX}*.json"), key=lambda p: p.stat().st_mtime,
-                             reverse=True)
-        if candidates2:
-            return candidates2[0]
-        return None
+        candidates = []
+
+        for exp_json in EXPERIMENTS_DIR.glob("experiment_*/experiment.json"):
+            try:
+                data = json.loads(exp_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            # only unfinished experiments are resumable
+            if data.get("status") != "completed":
+                candidates.append((exp_json, data))
+
+        if not candidates:
+            return None
+
+        # prefer the one with the highest current_index or latest snapshot
+        def resume_priority(item):
+            _, data = item
+            idx = int(data.get("current_index", 0))
+            strategies = data.get("strategies", [])
+            snap_steps = 0
+            if 0 <= idx < len(strategies):
+                snap = strategies[idx].get("snapshot")
+                if snap:
+                    snap_steps = int(snap.get("steps", 0))
+            return (idx, snap_steps)
+
+        candidates.sort(key=resume_priority, reverse=True)
+        return candidates[0][0]
+
+    def _show_resume_modal(self, exp_path: Path) -> bool:
+        """
+        Ask the user whether to resume an unfinished experiment.
+        Returns True to resume, False to discard.
+        """
+        name = exp_path.parent.name
+
+        self._show_modal(
+            title="Resume Experiment?",
+            message=(
+                "An unfinished experiment was found:\n\n"
+                f"{name}\n\n"
+                "Press ENTER to resume\n"
+                "Press ESC to start a new experiment"
+            ),
+            background=(28, 32, 40),
+            title_color=(120, 200, 255),
+            hint="ENTER = Resume | ESC = New",
+            exit_keys={pygame.K_RETURN, pygame.K_ESCAPE},
+        )
+
+        # capture last key pressed
+        keys = pygame.key.get_pressed()
+        return keys[pygame.K_RETURN]
 
     def _load_or_create_experiment(
             self,
@@ -465,32 +510,60 @@ class ExperimentRunnerGUI:
     ):
         """
         Load the most recent unfinished experiment if one exists.
-        Otherwise, create a new experiment using GUI-authoritative values.
+        User MUST explicitly choose whether to resume or discard it.
 
-        RULE: When resuming, we MUST ensure the experiment matches GUI parameters.
-        If parameters differ, we create a new experiment instead.
+        ENTER  -> resume unfinished experiment (GUI inputs ignored)
+        ESC    -> discard and create new experiment
         """
 
+        self._resumed = False
+
         # -------------------------------------------------
-        # 1) Look for most recent unfinished experiment
+        # 1) Detect unfinished experiment (no GUI gating)
         # -------------------------------------------------
         candidate = self._find_recent_experiment()
         if candidate:
             try:
                 data = json.loads(candidate.read_text(encoding="utf-8"))
 
-                if data.get("status") != "completed":
-                    # Check if stored parameters match GUI parameters
-                    stored_agents = len(data.get("agents", []))
-                    stored_parcels = len(data.get("parcels", []))
+                # Check if ALL strategies are completed
+                all_completed = True
+                strategies = data.get("strategies", [])
+                for strat in strategies:
+                    if strat.get("status") not in ["completed", "failed"]:
+                        all_completed = False
+                        break
 
-                    # CRITICAL: Only resume if parameters match
-                    if stored_agents == n_agents and stored_parcels == n_parcels:
-                        # Resume existing experiment
+                # Only resume if there's truly unfinished work
+                if data.get("status") != "completed" and not all_completed:
+                    # Always ask the user first
+                    if self._show_resume_modal(candidate):
+                        # -------- RESUME PATH --------
                         self.experiment = data
-                        self.experiment.setdefault("current_index", 0)
 
-                        # Backward compatibility: strategies
+                        # Ensure all required fields are present when resuming
+                        self.experiment.setdefault("run_id", str(uuid.uuid4())[:8])
+                        self.experiment.setdefault("current_index", 0)
+                        self.experiment.setdefault("schema_version", self.SCHEMA_VERSION)
+                        self.experiment.setdefault(
+                            "comm_config",
+                            self.default_comm_config.copy(),
+                        )
+                        self.experiment.setdefault("created_at", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+                        self.experiment.setdefault("results", [])
+
+                        # Ensure seed is set
+                        if "seed" not in self.experiment:
+                            self.experiment["seed"] = self.seed
+                        else:
+                            self.seed = self.experiment["seed"]
+
+                        # Ensure run_id is a string
+                        if "run_id" in self.experiment:
+                            self.experiment["run_id"] = str(self.experiment["run_id"])
+                        else:
+                            self.experiment["run_id"] = str(uuid.uuid4())[:8]
+
                         if "strategies" not in self.experiment:
                             planners = self.experiment.get("planners", ["local"])
                             self.experiment["strategies"] = [
@@ -498,151 +571,174 @@ class ExperimentRunnerGUI:
                                 for p in planners
                             ]
 
-                        # Schema evolution defaults
-                        self.experiment.setdefault("schema_version", self.SCHEMA_VERSION)
+                        # -------------------------------------------------
+                        # NORMALIZE STATE ON RESUME
+                        # -------------------------------------------------
+                        idx = int(self.experiment.get("current_index", 0))
 
-                        # Agents (default single agent if missing)
-                        if "agents" not in self.experiment:
-                            planners = self.experiment.get("planners", ["local"])
-                            self.experiment["agents"] = [
-                                {
-                                    "id": "agent_0",
-                                    "type": "drone",
-                                    "planner": planners[0],
-                                }
-                            ]
+                        # If we're at or past the last strategy, mark as completed
+                        if idx >= len(self.experiment["strategies"]):
+                            self.experiment["status"] = "completed"
+                            self._resumed = False  # Don't resume a completed experiment
+                            print("[EXPERIMENT] All strategies completed, starting fresh")
+                            return
 
-                        # Communication config
-                        self.experiment.setdefault(
-                            "comm_config",
-                            self.default_comm_config.copy()
-                        )
+                        # Check current strategy status
+                        if 0 <= idx < len(self.experiment["strategies"]):
+                            strat = self.experiment["strategies"][idx]
+
+                            # If strategy is already completed, move to next
+                            if strat.get("status") == "completed":
+                                self.experiment["current_index"] = idx + 1
+                                # If we've completed all strategies, mark experiment as completed
+                                if self.experiment["current_index"] >= len(self.experiment["strategies"]):
+                                    self.experiment["status"] = "completed"
+                                    self._resumed = False
+                                    print("[EXPERIMENT] Current strategy completed, moving to next")
+                                    return
+
+                            # If strategy is aborted, resume it
+                            elif strat.get("status") == "aborted":
+                                strat["status"] = "running"
+                                self.experiment["status"] = "in_progress"
+                                self._resumed = True
+
+                            # If strategy is running, keep it as is
+                            elif strat.get("status") == "running":
+                                self.experiment["status"] = "in_progress"
+                                self._resumed = True
+                        # -------------------------------------------------
 
                         self.experiment_json_path = candidate
-                        self.seed = self.experiment.get("seed", self.seed)
+                        self.experiment_dir = candidate.parent
 
-                        # IMPORTANT: Use GUI value, not stored value
-                        self.parcels = n_parcels  # ⬅️ FIX: Use GUI value
+                        self.seed = self.experiment.get("seed", self.seed)
+                        self.parcels = len(self.experiment.get("parcels", []))
+
+                        # Save the run_id for reference
+                        self.run_id = self.experiment["run_id"]
 
                         print(f"[EXPERIMENT] Resuming unfinished experiment {candidate}")
+                        print(f"[EXPERIMENT] Run ID: {self.run_id}")
                         return
-                    else:
-                        print(f"[EXPERIMENT] Parameters mismatch: "
-                              f"stored agents={stored_agents} vs GUI={n_agents}, "
-                              f"stored parcels={stored_parcels} vs GUI={n_parcels}")
-                        # Fall through to create new experiment
 
-                else:
-                    print(
-                        f"[EXPERIMENT] Most recent experiment {candidate} already completed. "
-                        "Creating new experiment."
-                    )
+                    # -------- DISCARD PATH --------
+                    print("[EXPERIMENT] Unfinished experiment discarded by user")
 
             except Exception as e:
-                print(f"[EXPERIMENT] Failed to resume {candidate}: {e}")
+                print(f"[EXPERIMENT] Failed to inspect {candidate}: {e}")
 
-        # -------------------------------------------------
-        # 2) Create new experiment (GUI IS AUTHORITATIVE)
-        # -------------------------------------------------
-        self.parcels = n_parcels
-        self.seed = int(time.time()) % (2 ** 31)
+        # If we get here, we're creating a new experiment
+        self._resumed = False
 
-        cols = self.screen_size[0] // GRID_SIZE
-        rows = self.screen_size[1] // GRID_SIZE
+    def _write_flight_artifacts(
+            self,
+            run_id: str,
+            planner: str,
+            flight_data: Dict,
+    ) -> Dict:
+        """
+        Persist flight recorder data into the current experiment directory.
+        """
 
-        center_col = max(2, cols // 2 - 2)
-        center_row = max(2, rows // 2 - 2)
+        if self.experiment_dir is None:
+            raise RuntimeError("Experiment directory not initialized")
 
-        station_cells = [
-            (c, r)
-            for r in range(center_row, center_row + 4)
-            for c in range(center_col, center_col + 4)
-        ]
+        base_name = f"flight_{planner}"
+        paths = {}
 
-        parcel_positions = deterministic_parcel_positions(
-            self.seed,
-            n_parcels,  # ✅ GUI VALUE USED HERE
-            cols,
-            rows,
-            forbidden_cells=station_cells,
+        agents_path = self.experiment_dir / f"{base_name}_agents.json"
+        agents_path.write_text(
+            json.dumps(flight_data["agents"], indent=2),
+            encoding="utf-8",
         )
+        paths["agents"] = agents_path.name
 
-        self.run_id = str(uuid.uuid4())[:8]
-        temp_name = f"{TEMP_PREFIX}{self.run_id}.json"
-        self.experiment_json_path = EXPERIMENTS_DIR / temp_name
-
-        planners = [selected_planner]
-        strategies = [
-            {"planner": p, "snapshot": None, "status": "pending"}
-            for p in planners
-        ]
-
-        # Parcels with stable IDs
-        parcels_with_id = []
-        for i, (c, r) in enumerate(parcel_positions):
-            parcels_with_id.append(
+        fleet_path = self.experiment_dir / f"{base_name}_fleet.json"
+        fleet_path.write_text(
+            json.dumps(
                 {
-                    "id": i,
-                    "col": int(c),
-                    "row": int(r),
-                    "picked": False,
-                    "delivered": False,
-                }
-            )
+                    "parcels": flight_data["parcels"],
+                    "fleet_events": flight_data["fleet_events"],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        paths["fleet"] = fleet_path.name
 
-        # Agents (GUI-controlled)
-        start_col = cols // 2
-        start_row = rows // 2
+        heatmap_path = self.experiment_dir / f"{base_name}_heatmap.json"
+        heatmap_path.write_text(
+            json.dumps(flight_data["heatmap"], indent=2),
+            encoding="utf-8",
+        )
+        paths["heatmap"] = heatmap_path.name
 
-        agents = [
-            {
-                "id": f"agent_{i}",
-                "type": "drone",
-                "planner": selected_planner,
-                "start_col": start_col + i * 2,
-                "start_row": start_row,
-            }
-            for i in range(n_agents)
-        ]
+        meta_path = self.experiment_dir / f"{base_name}_meta.json"
+        meta_path.write_text(
+            json.dumps(flight_data["meta"], indent=2),
+            encoding="utf-8",
+        )
+        paths["meta"] = meta_path.name
 
-        self.experiment = {
-            "schema_version": self.SCHEMA_VERSION,
-            "run_id": self.run_id,
-            "seed": self.seed,
-            "planners": planners,
-            "parcels": parcels_with_id,
-            "strategies": strategies,
-            "agents": agents,
-            "comm_config": self.default_comm_config.copy(),
-            "current_index": 0,
-            "status": "pending",
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "results": [],
-        }
-
-        self._write_experiment_json()
-        print(f"[EXPERIMENT] Created new experiment {self.experiment_json_path}")
+        return paths
 
     def _write_experiment_json(self):
         if not self.experiment_json_path:
             return
-        # persist current experiment state
-        self.experiment_json_path.write_text(json.dumps(self.experiment, indent=2), encoding="utf-8")
+
+        # Ensure directory exists
+        self.experiment_json_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.experiment_json_path.write_text(
+            json.dumps(self.experiment, indent=2),
+            encoding="utf-8",
+        )
+
+    def _persist_partial_results(
+            self,
+            idx: int,
+            planner_name: str,
+            metrics: MetricsAccumulator,
+            flight_recorder: FlightRecorder,
+            steps: int,
+            agents: List[Drone],
+    ):
+        # finalize metrics with current state
+        metrics.finalize(
+            steps,
+            agents[0].power.capacity if agents else 100.0,
+            agents[0].power.level if agents else 0.0,
+        )
+
+        # export flight data
+        flight_data = flight_recorder.export()
+
+        artifact_paths = self._write_flight_artifacts(
+            run_id=self.experiment["run_id"],
+            planner=planner_name,
+            flight_data=flight_data,
+        )
+
+        self.experiment["results"].append({
+            "planner": planner_name,
+            "seed": self.experiment["seed"],
+            "metrics": metrics.as_dict(),
+            "artifacts": artifact_paths,
+            "terminated": "aborted",
+            "steps_executed": steps,
+        })
+
+        self._write_experiment_json()
 
     def _finalize_experiment_file(self):
-        # rename temp_ to experiment_ when finished successfully
-        if not self.experiment_json_path:
-            return
-        p = self.experiment_json_path
-        if p.name.startswith(TEMP_PREFIX):
-            final = EXPERIMENTS_DIR / f"{EXPERIMENT_PREFIX}{p.name[len(TEMP_PREFIX):]}"
-            try:
-                p.rename(final)
-                self.experiment_json_path = final
-                print(f"[EXPERIMENT] Renamed {p} -> {final}")
-            except Exception:
-                # fallback to keeping existing path
-                pass
+        self.experiment["status"] = "completed"
+
+        # Clear all snapshots when experiment is fully completed
+        for strategy in self.experiment.get("strategies", []):
+            strategy["snapshot"] = None
+
+        self._write_experiment_json()
 
     # -----------------------
     # Snapshot and logging helpers
@@ -698,7 +794,11 @@ class ExperimentRunnerGUI:
           - parcels: list of parcel dicts (id, col, row, weight, picked, delivered)
           - steps, planner, time
         """
-        # map existing experiment parcels (by position) to their ids if they exist
+
+        if steps <= 0:
+            raise ValueError("Refusing to create snapshot with zero steps")
+
+        # map existing experiment parcels (by position) to their ids
         id_map = {}
         for pdef in self.experiment.get("parcels", []):
             key = (int(pdef["col"]), int(pdef["row"]))
@@ -708,7 +808,7 @@ class ExperimentRunnerGUI:
         for p in terrain.parcels:
             pid = id_map.get((int(p.col), int(p.row)))
             parcels_snap.append({
-                "id": pid if pid is not None else None,
+                "id": getattr(p, "id", None),
                 "col": int(p.col),
                 "row": int(p.row),
                 "weight": getattr(p, "weight", 1.0),
@@ -717,46 +817,56 @@ class ExperimentRunnerGUI:
             })
 
         agents_state = []
+        # In _make_snapshot method, update the agents_state loop:
         for idx, agent in enumerate(agents):
             carried_id = None
             if getattr(agent, "carrying", None):
-                carried = agent.carrying
-                # try to locate carried parcel id by matching position
-                for ps in parcels_snap:
-                    if ps["col"] == int(carried.col) and ps["row"] == int(carried.row):
-                        carried_id = ps.get("id")
-                        break
-            agent_state = {
-                "agent_id": self.experiment.get("agents", [{}])[idx].get("id", f"agent_{idx}"),
+                # Get the ID directly from the carried parcel
+                carried_id = getattr(agent.carrying, "id", None)
+
+            agents_state.append({
+                "agent_id": self.experiment["agents"][idx]["id"],
                 "type": "drone",
                 "col": int(agent.col),
                 "row": int(agent.row),
                 "pos_x": float(agent.pos.x),
                 "pos_y": float(agent.pos.y),
-                "battery_level": float(getattr(agent.power, "level", getattr(agent, "battery_capacity", 100.0))),
-                "battery_capacity": float(getattr(agent.power, "capacity", getattr(agent, "battery_capacity", 100.0))),
-                "carrying_id": carried_id,
-            }
-            agents_state.append(agent_state)
+                "battery_level": float(agent.power.level),
+                "battery_capacity": float(agent.power.capacity),
+                "carrying_id": carried_id,  # Now properly tracks parcel ID
+            })
 
-        snap = {
+        return {
             "planner": planner_name,
             "steps": int(steps),
             "time": time.time(),
             "agents_state": agents_state,
             "parcels": parcels_snap,
         }
-        return snap
 
-    def _restore_snapshot(self, snapshot: Dict) -> Tuple[Terrain, List[Drone], int]:
+    def _restore_snapshot(self, snapshot: Dict) -> Tuple[Terrain, List[Drone], int, List[Parcel]]:
         """
-        Restore world state from a snapshot and return (terrain, agents_list, steps).
+        Restore world state from a snapshot and return (terrain, agents_list, steps, parcels).
+        Snapshot is authoritative.
+        """
 
-        Contract:
-        - Agent identity MUST come from snapshot["agents_state"][*]["agent_id"]
-        - No agent IDs are invented, reordered, or renamed
-        - Terrain is authoritative for spatial occupancy
-        """
+        # ----------------------------
+        # Validate snapshot
+        # ----------------------------
+        agents_state = snapshot.get("agents_state")
+        if not agents_state:
+            raise ValueError("Snapshot missing agents_state")
+
+        # ----------------------------
+        # Lock experiment agents to snapshot
+        # ----------------------------
+        self.experiment["agents"] = [
+            {
+                "id": a["agent_id"],
+                "type": "drone",
+            }
+            for a in agents_state
+        ]
 
         # ----------------------------
         # Recreate terrain
@@ -777,87 +887,97 @@ class ExperimentRunnerGUI:
         # ----------------------------
         # Recreate parcels
         # ----------------------------
-        parcels_snap = snapshot.get("parcels", [])
-        recreated: List[Parcel] = []
+        recreated_parcels: List[Parcel] = []
 
-        for ps in parcels_snap:
+        for ps in snapshot.get("parcels", []):
+            # Get parcel ID from snapshot
+            snapshot_parcel_id = ps.get("id")
+
+            # Create parcel (this will auto-generate a new UUID)
             p = Parcel(
                 int(ps["col"]),
                 int(ps["row"]),
-                terrain.grid_size,
-                weight=float(ps.get("weight", 1.0)),
+                terrain.grid_size
             )
+
+            # Override the auto-generated ID with the one from snapshot
+            # This ensures we preserve the same IDs across save/load cycles
+            if snapshot_parcel_id is not None:
+                p.id = str(snapshot_parcel_id)  # Ensure it's a string
+
+            # Restore parcel state
             p.picked = bool(ps.get("picked", False))
             p.delivered = bool(ps.get("delivered", False))
-            recreated.append(p)
 
-        terrain.parcels = recreated
+            # Restore weight if available
+            if "weight" in ps:
+                p.weight = float(ps["weight"])
+
+            recreated_parcels.append(p)
+
+            print(f"[RESTORE] Parcel at ({int(ps['col'])},{int(ps['row'])}) - "
+                  f"ID: {p.id}, picked: {p.picked}, delivered: {p.delivered}")
+
+        terrain.parcels = recreated_parcels
 
         # ----------------------------
-        # Recreate agents (STRICT)
+        # Recreate agents
         # ----------------------------
-        agents_state = snapshot.get("agents_state")
-        if not agents_state:
-            raise ValueError("Snapshot missing agents_state; cannot restore agents")
-
         agents: List[Drone] = []
 
         for astate in agents_state:
-            if "agent_id" not in astate:
-                raise ValueError("Snapshot agent missing agent_id; refusing to restore")
-
             agent_id = astate["agent_id"]
 
-            start_col = int(astate["col"])
-            start_row = int(astate["row"])
-
             drone = Drone(
-                start_cell=(start_col, start_row),
+                start_cell=(int(astate["col"]), int(astate["row"])),
                 grid_size=GRID_SIZE,
                 screen_size=self.screen_size,
                 terrain=terrain,
                 agent_id=agent_id,
             )
 
-            # --- restore precise position ---
+            # precise position
             drone.pos = pygame.Vector2(
-                float(astate.get("pos_x", drone.pos.x)),
-                float(astate.get("pos_y", drone.pos.y)),
+                float(astate["pos_x"]),
+                float(astate["pos_y"]),
             )
-            drone.col = start_col
-            drone.row = start_row
-            drone.last_cell = (start_col, start_row)
+            drone.col = int(astate["col"])
+            drone.row = int(astate["row"])
+            drone.last_cell = (drone.col, drone.row)
 
-            # --- restore battery ---
+            # battery
             cap = float(astate.get("battery_capacity", drone.power.capacity))
             lvl = float(astate.get("battery_level", drone.power.level))
             drone.power.capacity = cap
             drone.power.level = min(lvl, cap)
 
-            # --- restore carried parcel ---
+            # carried parcel - match by ID
             carrying_id = astate.get("carrying_id")
             if carrying_id is not None:
-                id_to_pos = {
-                    orig["id"]: (int(orig["col"]), int(orig["row"]))
-                    for orig in self.experiment.get("parcels", [])
-                }
-                target_pos = id_to_pos.get(carrying_id)
+                # Convert to string for comparison
+                carrying_id_str = str(carrying_id)
 
-                if target_pos:
-                    for p in recreated:
-                        if (p.col, p.row) == target_pos:
-                            drone.carrying = p
-                            break
+                # Find parcel by ID
+                for p in recreated_parcels:
+                    if getattr(p, "id", None) == carrying_id_str:
+                        drone.carrying = p
+                        print(f"[RESTORE] Agent {agent_id} is carrying parcel {carrying_id_str}")
+                        break
+                else:
+                    print(
+                        f"[RESTORE] WARNING: Agent {agent_id} should be carrying parcel {carrying_id_str} but it wasn't found")
 
+            terrain.register_agent_cell(drone, drone.col, drone.row)
             agents.append(drone)
 
-            # ----------------------------
-            # Register occupancy explicitly
-            # ----------------------------
-            terrain.register_agent_cell(drone, drone.col, drone.row)
+            print(f"[RESTORE] Agent {agent_id} at ({drone.col},{drone.row}) - "
+                  f"battery: {drone.power.level:.1f}%")
 
         steps = int(snapshot.get("steps", 0))
-        return terrain, agents, steps
+
+        print(f"[RESTORE] Snapshot restored: {len(agents)} agents, {len(recreated_parcels)} parcels, step {steps}")
+
+        return terrain, agents, steps, recreated_parcels
 
     # -----------------------
     # Existing UI helpers
@@ -1026,21 +1146,17 @@ class ExperimentRunnerGUI:
 
         return agents, 0, None
 
-    def _setup_scene(self, maybe_snapshot: Optional[Dict] = None) -> Tuple[Terrain, List[Drone], int]:
+    def _setup_scene(self, maybe_snapshot: Optional[Dict] = None) -> Tuple[Terrain, List[Drone], int, List[Parcel]]:
         """
         Create Terrain and agents.
         If maybe_snapshot provided, restore world state from it.
-        Returns (terrain, agents_list, steps_already_taken)
+        Returns (terrain, agents_list, steps_already_taken, all_parcels)
         """
 
-        # ---- Snapshot path (authoritative) ----
-        if maybe_snapshot:
-            try:
-                terrain, agents, steps = self._restore_snapshot(maybe_snapshot)
-                return terrain, agents, steps
-            except Exception:
-                # fall back to fresh scene if snapshot restore fails
-                pass
+        # ---- Snapshot path (AUTHORITATIVE) ----
+        if maybe_snapshot is not None:
+            terrain, agents, steps, all_parcels = self._restore_snapshot(maybe_snapshot)  # Changed to 4 values
+            return terrain, agents, steps, all_parcels
 
         # ---- Fresh scene path (from experiment schema) ----
 
@@ -1058,16 +1174,9 @@ class ExperimentRunnerGUI:
         center_row = max(2, rows // 2 - 2)
         terrain.add_station(center_col, center_row, w=4, h=4)
 
-        # 2. Parcels (schema-driven, deterministic)
+        # 2. Parcels (schema-driven)
         for pdef in self.experiment.get("parcels", []):
-            if not isinstance(pdef, dict):
-                continue
-
-            terrain.add_parcel(
-                int(pdef["col"]),
-                int(pdef["row"]),
-            )
-
+            terrain.add_parcel(int(pdef["col"]), int(pdef["row"]))
             p = terrain.parcel_at_cell(
                 int(pdef["col"]),
                 int(pdef["row"]),
@@ -1077,14 +1186,16 @@ class ExperimentRunnerGUI:
                 p.picked = bool(pdef.get("picked", False))
                 p.delivered = bool(pdef.get("delivered", False))
 
-        # 3. Agents (delegated, future-proof)
+        # 3. Agents
         agents_dict, steps, error = self._setup_agents(terrain)
-
         if error:
             self._show_error_and_restart_setup(error)
-            raise RuntimeError("Restart setup")  # intentional control break
+            raise RuntimeError("Restart setup")
 
-        return terrain, list(agents_dict.values()), steps
+        # Collect all parcels (both newly created and existing)
+        all_parcels = list(terrain.parcels)
+
+        return terrain, list(agents_dict.values()), steps, all_parcels
 
     @staticmethod
     def all_parcels_delivered(terrain) -> bool:
@@ -1107,77 +1218,184 @@ class ExperimentRunnerGUI:
                 and drone.power.level <= 0.0
         )
 
+    def _debug_mission_state(self, terrain, agents, step):
+        print(f"\n[DEBUG][Step {step}] Mission State Check:")
+        print("Parcels:")
+        for p in terrain.parcels:
+            pid = getattr(p, "id", "unknown")
+            picked = getattr(p, "picked", False)
+            delivered = getattr(p, "delivered", False)
+            col = getattr(p, "col", "?")
+            row = getattr(p, "row", "?")
+            print(f"  Parcel {pid} at ({col},{row}): picked={picked}, delivered={delivered}")
+
+        print("\nAgents:")
+        for a in agents:
+            aid = getattr(a, "agent_id", "unknown")
+            carrying = getattr(a, "carrying", None)
+            if carrying:
+                pid = getattr(carrying, "id", "unknown")
+                print(f"  Agent {aid}: CARRYING parcel {pid}")
+            else:
+                print(f"  Agent {aid}: Not carrying")
+        # Check mission_exhausted conditions
+        undelivered = any(not getattr(p, "delivered", False) for p in terrain.parcels)
+        carrying = any(getattr(a, "carrying", None) is not None for a in agents)
+        print(f"\nConditions: undelivered={undelivered}, carrying={carrying}")
+        print(f"mission_exhausted result: {self.mission_exhausted(terrain, agents)}")
+
+    def all_alive_agents_parked(self, terrain, agents) -> bool:
+        """Check if all alive agents are at the station."""
+        for agent in agents:
+            if not self.agent_dead(agent):
+                if not self.agent_at_base(agent, terrain):
+                    return False
+        return True
+
+    def mission_exhausted(self, terrain, agents) -> bool:
+        # 1. Check all parcels - if any are not delivered, mission is not exhausted
+        for p in terrain.parcels:
+            if not getattr(p, "delivered", False):
+                return False
+
+        # 2. No agent is carrying a parcel
+        for a in agents:
+            if getattr(a, "carrying", None) is not None:
+                return False
+
+        # 3. No agent has a pending task
+        for agent in agents:
+            controller = getattr(agent, "controller", None)
+            if controller and getattr(controller, "has_pending_task", False):
+                return False
+
+        # 4. ALL ALIVE AGENTS MUST BE AT THE STATION (PARKED)
+        for agent in agents:
+            if not self.agent_dead(agent):
+                # Check if agent is at the station
+                if not self.agent_at_base(agent, terrain):
+                    return False
+                # Also check if the controller recognizes it's parked
+                controller = getattr(agent, "controller", None)
+                if controller and hasattr(controller, "parked"):
+                    if not controller.parked:
+                        return False
+
+        return True
+
     def run(self):
         # -------------------------------------------------
         # Splash + setup phase (single abort boundary)
         # -------------------------------------------------
         self.show_splash(timeout=1.0)
 
-        while True:
-            try:
-                # --- experiment scale setup (AUTHORITATIVE) ---
-                n_agents, n_parcels = self.show_experiment_setup(
-                    initial_agents=1,
-                    initial_parcels=self.parcels,
-                )
+        # -------------------------------------------------
+        # Attempt resume BEFORE any setup UI
+        # -------------------------------------------------
+        self._load_or_create_experiment(
+            n_agents=None,
+            n_parcels=None,
+            selected_planner=None,
+        )
 
-                self.parcels = n_parcels
-
-                # --- planner selection ---
-                selected_planner = self.show_setup_and_planner_select()
-
-                # -------------------------------------------------
-                # Load or create experiment AFTER GUI (SAFE)
-                # -------------------------------------------------
-                self._load_or_create_experiment(
-                    n_agents=n_agents,
-                    n_parcels=n_parcels,
-                    selected_planner=selected_planner,
-                )
-
-                break  # only break once everything is valid
-
-            except RuntimeError:
-                # Recoverable configuration error → return to setup
-                continue
-
-            except SystemExit:
-                print("[EXPERIMENT] User aborted at setup")
-                return
+        if not getattr(self, "_resumed", False):
+            while True:
+                try:
+                    n_agents, n_parcels = self.show_experiment_setup(
+                        initial_agents=1,
+                        initial_parcels=self.parcels,
+                    )
+                    self.parcels = n_parcels
+                    selected_planner = self.show_setup_and_planner_select()
+                    self._load_or_create_experiment(
+                        n_agents=n_agents,
+                        n_parcels=n_parcels,
+                        selected_planner=selected_planner,
+                    )
+                    break
+                except RuntimeError:
+                    continue
+                except SystemExit:
+                    print("[EXPERIMENT] User aborted at setup")
+                    return
 
         # -------------------------------------------------
         # Commit setup choices to experiment schema
         # -------------------------------------------------
-        self.parcels = n_parcels
+        if not getattr(self, "_resumed", False):
+            self.parcels = n_parcels
+            planners = [selected_planner]
 
-        planners = [selected_planner]
-        self.experiment["planners"] = planners
-
-        # rebuild agents deterministically
-        start_col = (self.screen_size[0] // GRID_SIZE) // 2
-        start_row = (self.screen_size[1] // GRID_SIZE) // 2
-
-        self.experiment["agents"] = [
-            {
-                "id": f"agent_{i}",
-                "type": "drone",
-                "planner": selected_planner,
-                "start_col": start_col + i * 2,
-                "start_row": start_row,
+            # Create new experiment with all required fields
+            self.experiment = {
+                "schema_version": self.SCHEMA_VERSION,
+                "run_id": self.run_id,
+                "seed": self.seed,
+                "planners": planners,
+                "parcels": [],  # Will be populated below
+                "agents": [],
+                "comm_config": self.default_comm_config.copy(),
+                "current_index": 0,
+                "status": "in_progress",
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                "results": [],
+                "strategies": [
+                    {"planner": p, "snapshot": None, "status": "pending"} for p in planners
+                ]
             }
-            for i in range(n_agents)
-        ]
 
-        if "strategies" not in self.experiment or len(self.experiment["strategies"]) != len(planners):
-            self.experiment["strategies"] = [
-                {"planner": p, "snapshot": None, "status": "pending"} for p in planners
+            # Generate parcel positions
+            cols = self.screen_size[0] // GRID_SIZE
+            rows = self.screen_size[1] // GRID_SIZE
+            center_col = max(2, cols // 2 - 2)
+            center_row = max(2, rows // 2 - 2)
+
+            # Forbidden cells around the station
+            forbidden_cells = []
+            for r in range(center_row, center_row + 4):
+                for c in range(center_col, center_col + 4):
+                    forbidden_cells.append((c, r))
+
+            parcel_positions = deterministic_parcel_positions(
+                self.seed, n_parcels, cols, rows, forbidden_cells
+            )
+
+            # Add parcels to experiment
+            for i, (col, row) in enumerate(parcel_positions):
+                # Generate a string ID for each parcel
+                parcel_id = f"parcel_{i:03d}"  # e.g., "parcel_000", "parcel_001"
+                # OR use UUID: parcel_id = str(uuid.uuid4())[:8]
+
+                # Update the parcel creation to be more explicit:
+                parcel_data = {
+                    "id": str(parcel_id),  # Explicitly cast to string
+                    "col": int(col),
+                    "row": int(row),
+                    "picked": bool(False),
+                    "delivered": bool(False)
+                }
+                self.experiment["parcels"].append(parcel_data)
+            # rebuild agents deterministically
+            start_col = (self.screen_size[0] // GRID_SIZE) // 2
+            start_row = (self.screen_size[1] // GRID_SIZE) // 2
+
+            self.experiment["agents"] = [
+                {
+                    "id": f"agent_{i}",
+                    "type": "drone",
+                    "planner": selected_planner,
+                    "start_col": start_col + i * 2,
+                    "start_row": start_row,
+                }
+                for i in range(n_agents)
             ]
 
-        self.experiment["current_index"] = 0
-        self.experiment.setdefault("schema_version", self.SCHEMA_VERSION)
-        self.experiment.setdefault("comm_config", self.default_comm_config.copy())
+            # Create experiment directory
+            self.experiment_dir = EXPERIMENTS_DIR / f"experiment_{self.run_id}"
+            self.experiment_dir.mkdir(parents=True, exist_ok=True)
+            self.experiment_json_path = self.experiment_dir / "experiment.json"
 
-        self._write_experiment_json()
+            self._write_experiment_json()
 
         # -------------------------------------------------
         # STRATEGY LOOP
@@ -1186,14 +1404,19 @@ class ExperimentRunnerGUI:
             if idx < int(self.experiment.get("current_index", 0)):
                 continue
 
+            # Reset completion wait counter for this strategy
+            if hasattr(self, '_completion_wait_counter'):
+                del self._completion_wait_counter
             planner_name = strategy["planner"]
             print(f"[EXPERIMENT] Running planner '{planner_name}' ({idx + 1}/{len(self.experiment['strategies'])})")
 
             self._configure_planner(planner_name)
 
             snapshot = strategy.get("snapshot")
+            # In the run method, update the _setup_scene call:
             try:
-                terrain, agents, pre_steps = self._setup_scene(snapshot)
+                terrain, agents, pre_steps, all_parcels = self._setup_scene(snapshot)
+                # assert pre_steps > 0, "Resume expected non-zero steps but got 0"
             except AgentSpawnError as e:
                 self._show_error_and_restart_setup(str(e))
                 return  # exit run(), caller restarts setup
@@ -1204,316 +1427,565 @@ class ExperimentRunnerGUI:
             # -------------------------------------------------
             # >>> FLIGHT RECORDER: instantiate once per strategy
             # -------------------------------------------------
+            run_id = self.experiment["run_id"]
             flight_recorder = FlightRecorder(
-                run_id=self.experiment["run_id"],
+                run_id=run_id,
                 planner=planner_name,
                 agents=self.experiment["agents"],
-                parcels=self.experiment["parcels"],
+                parcels=self.experiment["parcels"],  # Still pass initial parcel definitions
                 grid_size=GRID_SIZE,
                 sim_dt=1.0 / 60.0,
             )
 
-            # controllers (one per agent)
-            controllers = {}
-            for i, drone in enumerate(agents):
-                agent_id = self.experiment["agents"][i]["id"]
-                drone.agent_id = agent_id
-                human = HumanAgentController(drone, terrain)
-                ai = AIAgentController(
-                    drone,
-                    terrain,
-                    enable_reactive_fallback=True,
-                    flight_recorder=flight_recorder
-                )
-                print("Drone", drone)
-                print("Drone ID", drone.agent_id)
-                switcher = ControllerSwitcher([human, ai])
-                switcher.index = 1
-                controllers[agent_id] = switcher
+            # After creating flight_recorder:
+            if snapshot:
+                # Reconstruct history from snapshot
+                flight_recorder.reconstruct_from_snapshot(snapshot)
 
-            metrics = MetricsAccumulator(
-                run_id=self.experiment["run_id"],
-                planner=planner_name,
-                seed=self.experiment["seed"],
-                n_drones=len(agents),
-                n_parcels=len(self.experiment.get("parcels", [])),
-                comm_reliability=self.experiment["comm_config"].get("reliability", 1.0),
-                battery_capacity=agents[0].power.capacity if agents else 100.0,
-                episodic_interval=1.0,
-            )
-
-            steps = int(pre_steps or 0)
-            last_move_time = time.time()
-            last_action_time = time.time()
-            aborted = False
-
-            prev_positions = {i: (a.pos.x, a.pos.y) for i, a in enumerate(agents)}
-
-            # -------------------------------------------------
-            # MAIN SIMULATION LOOP
-            # -------------------------------------------------
-
-            while steps < self.max_steps:
-                steps += 1
-                sim_time = steps * (1.0 / 60.0)
-
-                for e in pygame.event.get():
-                    if e.type == pygame.QUIT:
-                        aborted = True
-                        break
-
-                    if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
-                        now = time.time()
-                        active = ((now - last_move_time) < 2.0) or ((now - last_action_time) < 2.0)
-                        if active:
-                            aborted = True
-                        else:
-                            steps = self.max_steps
-                        raise SystemExit()
-
-                    for switcher in controllers.values():
-                        switcher.handle_event(e)
-
-                if aborted:
-                    snap = self._make_snapshot(planner_name, agents, terrain, steps)
-                    self.experiment["strategies"][idx]["snapshot"] = snap
-                    self.experiment["strategies"][idx]["status"] = "aborted"
-                    self.experiment["status"] = "aborted"
-                    self.experiment["current_index"] = idx
-                    self._write_experiment_json()
-                    break
-
-                dt = self.clock.tick(60) / 1000.0
-
-                # ------------------------------
-                # UPDATE AGENTS
-                # ------------------------------
+                # Then register current parcels (they'll be skipped if already registered)
+                for parcel in all_parcels:
+                    flight_recorder.register_parcel(parcel)
+            else:
+                # New simulation
+                for parcel in all_parcels:
+                    flight_recorder.register_parcel(parcel)
+            try:
+                # controllers (one per agent)
+                controllers = {}
                 for i, drone in enumerate(agents):
                     agent_id = self.experiment["agents"][i]["id"]
-                    controllers[agent_id].update(dt, steps, sim_time)
-                    drone.update(
-                        dt,
-                        SPEED,
-                        ANIM_FPS,
-                        rot_frames_with_parcel=self.images.get("drone_rot_with_parcel_frames"),
-                        rot_frames=self.images.get("drone_rot_frames"),
+                    drone.agent_id = agent_id
+                    human = HumanAgentController(drone, terrain)
+                    ai = AIAgentController(
+                        drone,
+                        terrain,
+                        enable_reactive_fallback=True,
+                        flight_recorder=flight_recorder
                     )
+                    print("Drone", drone)
+                    print("Drone ID", drone.agent_id)
+                    switcher = ControllerSwitcher([human, ai])
+                    switcher.index = 1
+                    controllers[agent_id] = switcher
 
-                    px, py = prev_positions[i]
-                    dx = drone.pos.x - px
-                    dy = drone.pos.y - py
-                    dist = (dx * dx + dy * dy) ** 0.5
-                    if dist > 0.001:
-                        last_move_time = time.time()
+                metrics = MetricsAccumulator(
+                    run_id=self.experiment["run_id"],
+                    planner=planner_name,
+                    seed=self.experiment["seed"],
+                    n_drones=len(agents),
+                    n_parcels=len(self.experiment.get("parcels", [])),
+                    comm_reliability=self.experiment["comm_config"].get("reliability", 1.0),
+                    battery_capacity=agents[0].power.capacity if agents else 100.0,
+                    episodic_interval=1.0,
+                )
 
-                    metrics.record_distance(dist, GRID_SIZE)
-                    prev_positions[i] = (drone.pos.x, drone.pos.y)
+                steps = int(pre_steps or 0)
+                last_move_time = time.time()
+                last_action_time = time.time()
+                aborted = False
+                strategy_finished = False
+
+                prev_positions = {i: (a.pos.x, a.pos.y) for i, a in enumerate(agents)}
+
+                # -------------------------------------------------
+                # MAIN SIMULATION LOOP
+                # -------------------------------------------------
+
+                while steps < self.max_steps:
+                    steps += 1
+                    sim_time = steps * (1.0 / 60.0)
+
+                    for e in pygame.event.get():
+                        if e.type == pygame.QUIT:
+                            aborted = True
+                            break
+
+                        if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                            aborted = True
+                            break
+
+                        for switcher in controllers.values():
+                            switcher.handle_event(e)
+
+                    if aborted and not strategy_finished:
+                        # DEBUG: Check why mission isn't exhausted
+                        self._debug_mission_state(terrain, agents, steps)
+
+                        # Check if mission is effectively complete
+                        mission_effectively_complete = True
+
+                        # List to track parcels that are in invalid state (picked but not carried)
+                        invalid_parcels = []
+
+                        # Check all parcels
+                        for p in terrain.parcels:
+                            picked = getattr(p, "picked", False)
+                            delivered = getattr(p, "delivered", False)
+
+                            if not delivered:
+                                # Parcel is not delivered - check if it's in invalid state
+                                if picked:
+                                    # Parcel is marked as picked but not delivered
+                                    # Check if any agent is actually carrying it
+                                    is_carried = False
+                                    for agent in agents:
+                                        carrying = getattr(agent, "carrying", None)
+                                        if carrying:
+                                            # Check if this is the same parcel
+                                            if (int(carrying.col) == int(p.col) and
+                                                    int(carrying.row) == int(p.row)):
+                                                is_carried = True
+                                                break
+
+                                    if not is_carried:
+                                        # This is an invalid state - parcel is marked as picked but not carried
+                                        invalid_parcels.append(p)
+                                        print(
+                                            f"[ABORT-CHECK] Found invalid parcel at ({int(p.col)},{int(p.row)}): picked=True, delivered=False, but not carried")
+                                    else:
+                                        # Parcel is actually being carried
+                                        mission_effectively_complete = False
+                                        print(
+                                            f"[ABORT-CHECK] Parcel at ({int(p.col)},{int(p.row)}) is being carried by an agent")
+                                else:
+                                    # Parcel is neither picked nor delivered - definitely not complete
+                                    mission_effectively_complete = False
+                                    print(
+                                        f"[ABORT-CHECK] Parcel at ({int(p.col)},{int(p.row)}) is not picked and not delivered")
+
+                        # Check if any agents are carrying parcels (excluding invalid ones)
+                        for agent in agents:
+                            carrying = getattr(agent, "carrying", None)
+                            if carrying:
+                                # Check if this is one of the invalid parcels we identified
+                                is_invalid = False
+                                for invalid_p in invalid_parcels:
+                                    if (int(carrying.col) == int(invalid_p.col) and
+                                            int(carrying.row) == int(invalid_p.row)):
+                                        is_invalid = True
+                                        break
+
+                                if not is_invalid:
+                                    # Agent is carrying a valid parcel
+                                    mission_effectively_complete = False
+                                    print(
+                                        f"[ABORT-CHECK] Agent {getattr(agent, 'agent_id', 'unknown')} is carrying a valid parcel")
+
+                        # Check if all alive agents are at the station
+                        for agent in agents:
+                            if not self.agent_dead(agent):
+                                if not self.agent_at_base(agent, terrain):
+                                    mission_effectively_complete = False
+                                    print(
+                                        f"[ABORT-CHECK] Agent {getattr(agent, 'agent_id', 'unknown')} is not at station")
+                                    break
+
+                        # Special case: If we have invalid parcels but everything else is complete,
+                        # we should fix the parcel states and mark as complete
+                        if invalid_parcels and mission_effectively_complete:
+                            print(
+                                f"[ABORT-CHECK] Found {len(invalid_parcels)} invalid parcels, but mission is otherwise complete")
+                            print("[ABORT-CHECK] Fixing invalid parcel states...")
+
+                            # Fix the invalid parcels - mark them as delivered since mission is complete
+                            for p in invalid_parcels:
+                                p.delivered = True
+                                p.picked = False
+                                print(f"[ABORT-CHECK] Fixed parcel at ({int(p.col)},{int(p.row)}) to delivered=True")
+
+                        # Check again after fixing invalid parcels
+                        if mission_effectively_complete:
+                            # Re-check after fixing parcels
+                            all_delivered_now = all(getattr(p, "delivered", False) for p in terrain.parcels)
+                            no_carrying_now = all(getattr(a, "carrying", None) is None for a in agents)
+
+                            if all_delivered_now and no_carrying_now:
+                                print(
+                                    "[EXPERIMENT] Mission effectively complete! Marking as completed instead of aborted.")
+
+                                # Mission is complete, mark as completed
+                                self.experiment["strategies"][idx]["status"] = "completed"
+                                self.experiment["strategies"][idx]["snapshot"] = None
+
+                                self.experiment["current_index"] = idx + 1
+                                if self.experiment["current_index"] >= len(self.experiment["strategies"]):
+                                    self.experiment["status"] = "completed"
+                                else:
+                                    self.experiment["status"] = "in_progress"
+
+                                metrics.finalize(steps, agents[0].power.capacity, agents[0].power.level)
+
+                                flight_data = flight_recorder.export()
+                                artifact_paths = self._write_flight_artifacts(
+                                    run_id=self.experiment["run_id"],
+                                    planner=planner_name,
+                                    flight_data=flight_data,
+                                )
+
+                                self.experiment["results"].append({
+                                    "planner": planner_name,
+                                    "seed": self.experiment["seed"],
+                                    "metrics": metrics.as_dict(),
+                                    "artifacts": artifact_paths,
+                                })
+
+                                self._write_experiment_json()
+                                print("[EXPERIMENT] Mission marked as completed successfully")
+
+                                # Show completion message briefly before returning
+                                completion_shown = False
+                                completion_start = time.time()
+                                while time.time() - completion_start < 2.0:  # Show for 2 seconds
+                                    for e in pygame.event.get():
+                                        if e.type == pygame.QUIT or (
+                                                e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                                            break
+
+                                    # Show completion screen
+                                    self.screen.fill((192, 192, 192))
+                                    for x in range(0, self.screen_size[0], GRID_SIZE):
+                                        pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
+                                    for y in range(0, self.screen_size[1], GRID_SIZE):
+                                        pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+
+                                    terrain.draw(self.screen)
+                                    for drone in agents:
+                                        drone.draw(self.screen, self.images)
+
+                                    # Overlay completion message
+                                    msg = self.large_font.render("MISSION COMPLETE!", True, (0, 200, 0))
+                                    self.screen.blit(msg, msg.get_rect(center=(self.screen_size[0] // 2, 100)))
+
+                                    pygame.display.flip()
+                                    self.clock.tick(30)
+                                    completion_shown = True
+
+                                if completion_shown:
+                                    return  # Exit the run method entirely
+                            else:
+                                print("[EXPERIMENT] Mission not complete, proceeding with abort...")
+                                # Fall through to abort logic below
+                        else:
+                            print("[EXPERIMENT] Mission not effectively complete")
+
+                        # If we reach here, mission was truly aborted mid-run
+                        snap = None
+                        try:
+                            snap = self._make_snapshot(planner_name, agents, terrain, steps)
+                        except ValueError:
+                            pass
+
+                        self.experiment["strategies"][idx]["snapshot"] = snap
+                        self.experiment["strategies"][idx]["status"] = "aborted"
+                        self.experiment["status"] = "aborted"
+                        self.experiment["current_index"] = idx
+
+                        self._persist_partial_results(
+                            idx=idx,
+                            planner_name=planner_name,
+                            metrics=metrics,
+                            flight_recorder=flight_recorder,
+                            steps=steps,
+                            agents=agents,
+                        )
+                        print("[EXPERIMENT] Mission aborted mid-run")
+
+                        break
+
+                    dt = self.clock.tick(60) / 1000.0
+
+                    # ------------------------------
+                    # UPDATE AGENTS
+                    # ------------------------------
+                    for i, drone in enumerate(agents):
+                        agent_id = self.experiment["agents"][i]["id"]
+                        controllers[agent_id].update(dt, steps, sim_time)
+                        drone.update(
+                            dt,
+                            SPEED,
+                            ANIM_FPS,
+                            rot_frames_with_parcel=self.images.get("drone_rot_with_parcel_frames"),
+                            rot_frames=self.images.get("drone_rot_frames"),
+                        )
+
+                        px, py = prev_positions[i]
+                        dx = drone.pos.x - px
+                        dy = drone.pos.y - py
+                        dist = (dx * dx + dy * dy) ** 0.5
+                        if dist > 0.001:
+                            last_move_time = time.time()
+
+                        metrics.record_distance(dist, GRID_SIZE)
+                        prev_positions[i] = (drone.pos.x, drone.pos.y)
+
+                        # -------------------------------------------------
+                        # >>> FLIGHT RECORDER: per-agent tick (state)
+                        # -------------------------------------------------
+                        flight_recorder.tick_agent(
+                            agent_id=agent_id,
+                            drone=drone,
+                            step=steps,
+                            sim_time=sim_time,
+                        )
+
+                        if hasattr(drone, "_last_action") and drone._last_action:
+                            kind, cell, parcel = drone._last_action
+                            last_action_time = time.time()
+
+                            # -------------------------------------------------
+                            # >>> FLIGHT RECORDER: record action
+                            # -------------------------------------------------
+                            flight_recorder.record_action(
+                                agent_id=agent_id,
+                                kind=kind,
+                                cell=cell,
+                                parcel=parcel,
+                                step=steps,
+                                sim_time=sim_time,
+                                world_time=time.time(),
+                            )
+
+                            if kind == "drop" and parcel and not getattr(parcel, "delivered", False):
+                                parcel.delivered = True
+                                parcel.picked = False
+                                try:
+                                    station = terrain.get_station_at(cell[0], cell[1])
+                                    if station:
+                                        try:
+                                            station.register_delivery(cell)
+                                        except TypeError:
+                                            station.register_delivery()
+                                except Exception:
+                                    pass
+                                metrics.record_task_complete(1)
+
+                            if kind in ("pick_failed", "drop_failed"):
+                                metrics.record_unsafe_failure(1)
+
+                            self._append_event(
+                                idx,
+                                {"step": steps, "type": kind, "agent": agent_id, "cell": cell},
+                            )
+
+                            drone._last_action = None
 
                     # -------------------------------------------------
-                    # >>> FLIGHT RECORDER: per-agent tick (state)
+                    # >>> FLIGHT RECORDER: fleet-level checks
                     # -------------------------------------------------
-                    flight_recorder.tick_agent(
-                        agent_id=agent_id,
-                        drone=drone,
+                    flight_recorder.tick_fleet(
+                        agents=agents,
                         step=steps,
                         sim_time=sim_time,
                     )
 
-                    if hasattr(drone, "_last_action") and drone._last_action:
-                        kind, cell, parcel = drone._last_action
-                        last_action_time = time.time()
+                    # -------------------------------------------------
+                    # TERMINATION CONDITIONS
+                    # -------------------------------------------------
 
-                        # -------------------------------------------------
-                        # >>> FLIGHT RECORDER: record action
-                        # -------------------------------------------------
-                        flight_recorder.record_action(
-                            agent_id=agent_id,
-                            kind=kind,
-                            cell=cell,
-                            parcel=parcel,
-                            step=steps,
-                            sim_time=sim_time,
-                            world_time=time.time(),
-                        )
+                    # ---------------------------------------------
+                    # 1. Detect and log agent losses (NON-TERMINAL)
+                    # ---------------------------------------------
+                    dead_agents = [a for a in agents if self.agent_dead(a)]
 
-                        if kind == "drop" and parcel and not getattr(parcel, "delivered", False):
-                            parcel.delivered = True
-                            parcel.picked = False
-                            try:
-                                station = terrain.get_station_at(cell[0], cell[1])
-                                if station:
-                                    try:
-                                        station.register_delivery(cell)
-                                    except TypeError:
-                                        station.register_delivery()
-                            except Exception:
-                                pass
-                            metrics.record_task_complete(1)
+                    for d in dead_agents:
+                        # Log each death only once
+                        if not getattr(d, "_death_logged", False):
+                            flight_recorder.fleet_events.append({
+                                "type": "agent_lost",
+                                "agent": getattr(d, "agent_id", None),
+                                "cell": (int(d.col), int(d.row)),
+                                "battery": getattr(d.power, "level", None),
+                                "time": {
+                                    "step": steps,
+                                    "sim_time": sim_time,
+                                    "world_time": time.time(),
+                                },
+                            })
+                            d._death_logged = True
 
-                        if kind in ("pick_failed", "drop_failed"):
-                            metrics.record_unsafe_failure(1)
-
-                        self._append_event(
-                            idx,
-                            {"step": steps, "type": kind, "agent": agent_id, "cell": cell},
-                        )
-
-                        drone._last_action = None
-
-                # -------------------------------------------------
-                # >>> FLIGHT RECORDER: fleet-level checks
-                # -------------------------------------------------
-                flight_recorder.tick_fleet(
-                    agents=agents,
-                    step=steps,
-                    sim_time=sim_time,
-                )
-
-                # -------------------------------------------------
-                # TERMINATION CONDITIONS
-                # -------------------------------------------------
-
-                # ---------------------------------------------
-                # 1. Detect and log agent losses (NON-TERMINAL)
-                # ---------------------------------------------
-                dead_agents = [a for a in agents if self.agent_dead(a)]
-
-                for d in dead_agents:
-                    # Log each death only once
-                    if not getattr(d, "_death_logged", False):
-                        flight_recorder.fleet_events.append({
-                            "type": "agent_lost",
-                            "agent": getattr(d, "agent_id", None),
-                            "cell": (int(d.col), int(d.row)),
-                            "battery": getattr(d.power, "level", None),
-                            "time": {
-                                "step": steps,
-                                "sim_time": sim_time,
-                                "world_time": time.time(),
-                            },
-                        })
-                        d._death_logged = True
-
-                # ---------------------------------------------
-                # 2. Determine remaining mission capability
-                # ---------------------------------------------
-                alive_agents = [a for a in agents if not self.agent_dead(a)]
-
-                # ---------------------------------------------
-                # 3. HARD FAILURE: mission impossible
-                # ---------------------------------------------
-                if not alive_agents and not self.all_parcels_delivered(terrain):
-                    # No agents left and parcels remain
-                    self.experiment["strategies"][idx]["status"] = "failed"
-                    self.experiment["status"] = "failed"
-                    self.experiment["current_index"] = idx + 1
-
-                    self._write_experiment_json()
-                    break
-
-                # ---------------------------------------------
-                # 4. SUCCESS CONDITION (INTENT-BASED)
-                # ---------------------------------------------
-                if self.all_parcels_delivered(terrain):
-
-                    all_alive_parked = True
-
-                    for i, drone in enumerate(agents):
-                        if self.agent_dead(drone):
-                            continue  # lost agents do not block completion
-
-                        agent_id = self.experiment["agents"][i]["id"]
-                        controller = controllers[agent_id].current
-
-                        if not getattr(controller, "parked", False):
-                            all_alive_parked = False
-                            break
-
-                    if all_alive_parked:
-                        # SUCCESS: parcels delivered AND all alive agents parked
-                        self.experiment["strategies"][idx]["status"] = "completed"
-                        self.experiment["strategies"][idx]["snapshot"] = None
+                    # ---------------------------------------------
+                    # 2. Determine remaining mission capability
+                    # ---------------------------------------------
+                    alive_agents = [a for a in agents if not self.agent_dead(a)]
+                    # ---------------------------------------------
+                    # 3. HARD FAILURE: mission impossible
+                    # ---------------------------------------------
+                    if not alive_agents and not self.all_parcels_delivered(terrain):
+                        # No agents left and parcels remain
+                        self.experiment["strategies"][idx]["status"] = "failed"
+                        self.experiment["status"] = "failed"
                         self.experiment["current_index"] = idx + 1
-
-                        self.experiment["status"] = (
-                            "completed"
-                            if idx + 1 >= len(self.experiment["strategies"])
-                            else "in_progress"
-                        )
 
                         self._write_experiment_json()
                         break
 
-                    # else:
-                    # Parcels delivered but some agents still parking.
-                    # Keep simulation running.
+                    # ---------------------------------------------
+                    # 4. SUCCESS CONDITION - NEW PARKING-AWARE CHECK
+                    # ---------------------------------------------
+                    if self.mission_exhausted(terrain, agents):
+                        print(f"[DEBUG] Mission exhausted condition met at step {steps}")
 
-                # ---------------------------------------------
-                # Otherwise: continue simulation
-                # ---------------------------------------------
+                        # Add a brief wait to ensure all agents are settled at the station
+                        if not hasattr(self, '_completion_wait_counter'):
+                            self._completion_wait_counter = 0
+                            print(f"[DEBUG] Starting completion wait...")
 
-                # rendering
-                self.screen.fill((192, 192, 192))
-                for x in range(0, self.screen_size[0], GRID_SIZE):
-                    pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
-                for y in range(0, self.screen_size[1], GRID_SIZE):
-                    pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+                        self._completion_wait_counter += 1
 
-                terrain.draw(self.screen)
-                for drone in agents:
-                    drone.draw(self.screen, self.images)
+                        # Wait for 1 second (60 frames at 60 FPS) before finalizing
+                        if self._completion_wait_counter < 60:
+                            print(f"[DEBUG] Waiting for agents to settle ({self._completion_wait_counter}/60)...")
+                            continue  # Continue simulation for a bit longer
 
-                pygame.display.flip()
+                        print(f"[DEBUG] All conditions confirmed. Marking strategy as completed.")
 
-            if aborted:
-                break
+                        # Mark strategy as completed and clear snapshot
+                        self.experiment["strategies"][idx]["status"] = "completed"
+                        self.experiment["strategies"][idx]["snapshot"] = None  # Clear snapshot when completed
 
-            metrics.finalize(steps, agents[0].power.capacity, agents[0].power.level)
+                        # Move to next strategy or complete experiment
+                        self.experiment["current_index"] = idx + 1
 
-            # -------------------------------------------------
-            # >>> FLIGHT RECORDER: export + persist
-            # -------------------------------------------------
-            flight_data = flight_recorder.export()
+                        if self.experiment["current_index"] >= len(self.experiment["strategies"]):
+                            self.experiment["status"] = "completed"
+                            print("[EXPERIMENT] All strategies completed")
+                        else:
+                            self.experiment["status"] = "in_progress"
+                            print(f"[EXPERIMENT] Moving to next strategy: {self.experiment['current_index']}")
 
-            self.experiment["results"].append({
-                "planner": planner_name,
-                "seed": self.experiment["seed"],
-                "metrics": metrics.as_dict(),
-                "flight_recorder": flight_data,
-            })
+                        # Finalize metrics and save results
+                        metrics.finalize(steps, agents[0].power.capacity, agents[0].power.level)
 
-            self._write_experiment_json()
+                        # Export flight data
+                        flight_data = flight_recorder.export()
+                        artifact_paths = self._write_flight_artifacts(
+                            run_id=self.experiment["run_id"],
+                            planner=planner_name,
+                            flight_data=flight_data,
+                        )
 
-            if self.experiment["status"] == "completed":
-                self._finalize_experiment_file()
+                        self.experiment["results"].append({
+                            "planner": planner_name,
+                            "seed": self.experiment["seed"],
+                            "metrics": metrics.as_dict(),
+                            "artifacts": artifact_paths,
+                        })
 
-        print("[EXPERIMENT] Runner finished. Experiment JSON files are in the experiments folder.")
-        # -------------------------------------------------
-        # POST-RUN INSPECTION LOOP
-        # -------------------------------------------------
-        print("[EXPERIMENT] Entering post-run inspection mode. Press ESC to exit.")
+                        self._write_experiment_json()
 
-        inspecting = True
-        while inspecting:
-            for e in pygame.event.get():
-                if e.type == pygame.QUIT:
-                    inspecting = False
-                elif e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
-                    inspecting = False
+                        # BREAK OUT OF SIMULATION LOOP IMMEDIATELY
+                        strategy_finished = True
+                        break
 
-            # redraw final world state
-            self.screen.fill((192, 192, 192))
-            for x in range(0, self.screen_size[0], GRID_SIZE):
-                pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
-            for y in range(0, self.screen_size[1], GRID_SIZE):
-                pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+                    # ---------------------------------------------
+                    # Otherwise: continue simulation
+                    # ---------------------------------------------
+                    # rendering
+                    self.screen.fill((192, 192, 192))
+                    for x in range(0, self.screen_size[0], GRID_SIZE):
+                        pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
+                    for y in range(0, self.screen_size[1], GRID_SIZE):
+                        pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
 
-            terrain.draw(self.screen)
-            for drone in agents:
-                drone.draw(self.screen, self.images)
+                    terrain.draw(self.screen)
+                    for drone in agents:
+                        drone.draw(self.screen, self.images)
 
-            pygame.display.flip()
-            self.clock.tick(30)
+                    pygame.display.flip()
+
+                if aborted:
+                    break
+
+                metrics.finalize(steps, agents[0].power.capacity, agents[0].power.level)
+
+                # -------------------------------------------------
+                # >>> FLIGHT RECORDER: export + persist
+                # -------------------------------------------------
+                flight_data = flight_recorder.export()
+
+                artifact_paths = self._write_flight_artifacts(
+                    run_id=self.experiment["run_id"],
+                    planner=planner_name,
+                    flight_data=flight_data,
+                )
+
+                self.experiment["results"].append({
+                    "planner": planner_name,
+                    "seed": self.experiment["seed"],
+                    "metrics": metrics.as_dict(),
+                    "artifacts": artifact_paths,
+                })
+
+                self._write_experiment_json()
+
+                # -------------------------------------------------
+                # POST-RUN CLEANUP
+                # -------------------------------------------------
+                # Update the post-run inspection section:
+                if self.experiment["status"] == "completed":
+                    print("[EXPERIMENT] All strategies completed. Experiment marked as complete.")
+
+                    # Show completion message briefly, then exit
+                    completion_time = 3.0  # Show for 3 seconds
+                    start_time = time.time()
+
+                    while time.time() - start_time < completion_time:
+                        for e in pygame.event.get():
+                            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                                return
+
+                        # Redraw final world state
+                        self.screen.fill((192, 192, 192))
+                        for x in range(0, self.screen_size[0], GRID_SIZE):
+                            pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
+                        for y in range(0, self.screen_size[1], GRID_SIZE):
+                            pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+
+                        terrain.draw(self.screen)
+                        for drone in agents:
+                            drone.draw(self.screen, self.images)
+
+                        # Show completion message
+                        msg = self.large_font.render("MISSION COMPLETE!", True, (0, 200, 0))
+                        self.screen.blit(msg, msg.get_rect(center=(self.screen_size[0] // 2, 100)))
+
+                        pygame.display.flip()
+                        self.clock.tick(30)
+
+                    return  # Exit after showing completion
+                else:
+                    # Only show post-run inspection if mission was aborted
+                    print("[EXPERIMENT] Entering post-run inspection mode. Press ESC to exit.")
+
+                    inspecting = True
+                    while inspecting:
+                        for e in pygame.event.get():
+                            if e.type == pygame.QUIT:
+                                inspecting = False
+                            elif e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                                inspecting = False
+
+                        # redraw final world state
+                        self.screen.fill((192, 192, 192))
+                        for x in range(0, self.screen_size[0], GRID_SIZE):
+                            pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
+                        for y in range(0, self.screen_size[1], GRID_SIZE):
+                            pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+
+                        terrain.draw(self.screen)
+                        for drone in agents:
+                            drone.draw(self.screen, self.images)
+
+                        pygame.display.flip()
+                        self.clock.tick(30)
+                return
+
+
+            finally:
+                try:
+                    flight_recorder.finalize()
+                except Exception:
+                    pass
 
 
 def main():
