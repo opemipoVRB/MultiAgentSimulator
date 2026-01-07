@@ -7,6 +7,8 @@ from resources import PowerResource, NetworkResource
 from collections import defaultdict, deque
 import pygame
 import uuid
+import time
+
 
 # -------------------------
 # World artifacts
@@ -165,6 +167,7 @@ class Drone:
         self.allow_diagonal = bool(allow_diagonal)
         self.allow_direct = bool(allow_direct)
         self.last_cell = (self.col, self.row)
+        self.network_active = False
 
     # -------------------------
     # A* (energy-aware) helpers
@@ -451,33 +454,6 @@ class Drone:
 
         return True
 
-    # def perform_drop(self, parcel: 'Parcel') -> bool:
-    #     """Drop the parcel at current cell; consumes drop energy and may set lost if battery drained."""
-    #     if parcel is None:
-    #         return False
-    #     cost = self.energy_needed_for_pick_drop(parcel.weight)
-    #     self.power.consume(cost)
-    #     if self.power.is_depleted():
-    #         # still place parcel but drone becomes lost
-    #         parcel.picked = False
-    #         parcel.col = self.col
-    #         parcel.row = self.row
-    #         parcel.pos = pygame.Vector2(self.col * self.grid_size + self.grid_size / 2,
-    #                                     self.row * self.grid_size + self.grid_size / 2)
-    #         self.carrying = None
-    #         self.lost = True
-    #         self._last_action = ("drop", (self.col, self.row), parcel)
-    #         return True
-    #
-    #     parcel.picked = False
-    #     parcel.col = self.col
-    #     parcel.row = self.row
-    #     parcel.pos = pygame.Vector2(self.col * self.grid_size + self.grid_size / 2,
-    #                                 self.row * self.grid_size + self.grid_size / 2)
-    #     self.carrying = None
-    #     self._last_action = ("drop", (self.col, self.row), parcel)
-    #     return True
-
     def perform_drop(self, parcel: 'Parcel') -> bool:
         """
         Drop the carried parcel at the drone's current grid cell.
@@ -588,7 +564,7 @@ class Drone:
         return self.power.level >= needed
 
     # -------------------------
-    # Drawing (keeps visuals similar to your earlier draw)
+    # Drawing
     # -------------------------
     def draw(self, surf, images: dict):
         """
@@ -698,6 +674,42 @@ class Drone:
             sz = max(8, int(self.grid_size * 0.15))
             pygame.draw.line(surf, (200, 40, 40), (x - sz, y - sz), (x + sz, y + sz), 3)
             pygame.draw.line(surf, (200, 40, 40), (x + sz, y - sz), (x - sz, y + sz), 3)
+
+    def draw_network_pulse(self, surf, min_cells=1, max_cells=2):
+        """
+        Visual-only network pulse for the drone.
+        Single solid filled pulse that oscillates smoothly.
+        """
+        if not self.network_active:
+            return
+
+        if self.network.is_depleted():
+            return
+
+        cx, cy = int(self.pos.x), int(self.pos.y)
+
+        # Smooth oscillation
+        t = time.time()
+        phase = 0.5 + 0.5 * math.sin(t * 2.5)  # 0 → 1 → 0
+
+        inner_radius = min_cells * self.grid_size
+        outer_radius = max_cells * self.grid_size
+        radius = int(inner_radius + phase * (outer_radius - inner_radius))
+
+        # Alpha fades slightly as it expands
+        alpha = int(110 - 50 * phase)
+
+        overlay = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+
+        # Solid filled pulse
+        pygame.draw.circle(
+            overlay,
+            (120, 200, 255, alpha),  # soft cyan-blue
+            (radius, radius),
+            radius,
+        )
+
+        surf.blit(overlay, (cx - radius, cy - radius))
 
 
 class DeliveryStation:
@@ -839,7 +851,9 @@ class Terrain:
         self.parcel_scale = parcel_scale
         self.parcels: List[Parcel] = []
         self.stations: List[DeliveryStation] = []
+        self.command_center = None
         self.agent_cells = {}  # agent_id -> (col, row)
+        self.agents = {}  # agent_id -> Drone
 
     def spawn_random(self, n: int):
         cols = self.screen_size[0] // self.grid_size
@@ -942,5 +956,333 @@ class Terrain:
     def draw(self, surf):
         for p in self.parcels:
             p.draw(surf, parcel_img=self.parcel_img, parcel_scale=self.parcel_scale)
+
         for s in self.stations:
             s.draw(surf)
+
+        if self.command_center:
+            self.command_center.draw(surf)
+
+
+class WorldView:
+    def snapshot(self) -> dict:
+        raise NotImplementedError
+
+
+class CommandCenter:
+    """
+    Non-mobile coordination artifact.
+
+    - Lives spatially in the world
+    - Owns a NetworkResource
+    - Has a communication range (in grid cells)
+    - Draws itself using an image and its network radius
+    """
+
+    def __init__(
+            self,
+            col: int,
+            row: int,
+            grid_size: int,
+            network_capacity: float = 100.0,
+            network_range: int = 12,
+            image_path: str = "assets/command_center.png",
+    ):
+        self.col = int(col)
+        self.row = int(row)
+        self.grid_size = int(grid_size)
+
+        self.pos = pygame.Vector2(
+            self.col * grid_size + grid_size / 2,
+            self.row * grid_size + grid_size / 2,
+        )
+
+        self.network = NetworkResource(capacity=network_capacity)
+        self.network_range = int(network_range)
+        self.terrain = None
+        self.agents = {}  # agent_id -> Drone
+
+        # Centralized brain lives here
+        from strategies.centralised import CentralisedStrategy
+        self.strategy = CentralisedStrategy()
+
+        # ----------------------------
+        # Load and scale icon
+        # ----------------------------
+        try:
+            raw = pygame.image.load(image_path).convert_alpha()
+            size = int(self.grid_size * 0.9)
+            self.image = pygame.transform.smoothscale(raw, (size, size))
+        except Exception as e:
+            print(f"[COMMAND CENTER] Failed to load image '{image_path}': {e}")
+            self.image = None
+
+    # -------------------------------------------------
+    # Connectivity
+    # -------------------------------------------------
+    def can_communicate(self, drone) -> bool:
+        if self.network.is_depleted() or drone.network.is_depleted():
+            return False
+
+        d = abs(self.col - drone.col) + abs(self.row - drone.row)
+        return d <= self.network_range
+
+    def consume_network(self, drone):
+        d = abs(self.col - drone.col) + abs(self.row - drone.row)
+        cost = float(d)
+        self.network.consume(cost)
+        drone.network.consume(cost)
+
+    # -------------------------------------------------
+    # Network pulse (VISIBLE)
+    # -------------------------------------------------
+    def _draw_network_pulse(self, surf):
+        cx, cy = int(self.pos.x), int(self.pos.y)
+
+        # ---- Pulse bounds in GRID CELLS ----
+        inner_cells = 2
+        outer_cells = max(inner_cells + 1, self.network_range)
+
+        inner_radius = inner_cells * self.grid_size
+        outer_radius = outer_cells * self.grid_size
+
+        # ---- Time-based smooth oscillation ----
+        t = time.time()
+        phase = 0.5 + 0.5 * math.sin(t * 2.0)  # 0 → 1 → 0
+
+        radius = int(inner_radius + phase * (outer_radius - inner_radius))
+
+        # Alpha fades as wave expands
+        alpha = int(140 - 80 * phase)
+
+        overlay = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+
+        # Soft expanding wave
+        pygame.draw.circle(
+            overlay,
+            (120, 170, 255, alpha),
+            (radius, radius),
+            radius,
+        )
+
+        # Wavefront ring
+        pygame.draw.circle(
+            overlay,
+            (160, 210, 255, min(200, alpha + 40)),
+            (radius, radius),
+            radius,
+            width=2,
+        )
+
+        surf.blit(overlay, (cx - radius, cy - radius))
+
+    # -------------------------------------------------
+    # Drawing
+    # -------------------------------------------------
+    def draw(self, surf):
+        cx, cy = int(self.pos.x), int(self.pos.y)
+
+        # --- Network pulse FIRST (so icon sits on top)
+        if not self.network.is_depleted():
+            self._draw_network_pulse(surf)
+
+        # --- Command center icon
+        if self.image:
+            rect = self.image.get_rect(center=(cx, cy))
+            surf.blit(self.image, rect)
+        else:
+            r = int(self.grid_size * 0.4)
+            pygame.draw.circle(surf, (90, 160, 255), (cx, cy), r, 3)
+
+    def bind_terrain(self, terrain):
+        self.terrain = terrain
+
+    def snapshot(self) -> dict:
+        """
+        Build an authoritative global snapshot of the world.
+
+        This snapshot is the ONLY information source available
+        to centralized strategies.
+        """
+        terrain = self.terrain
+
+        return {
+            "agents": [
+                {
+                    "id": a.agent_id,
+                    "col": a.col,
+                    "row": a.row,
+                    "battery_pct": a.power.percent(),
+                }
+                for a in terrain.agents.values()
+            ],
+            "parcels": [
+                {
+                    "id": p.id,
+                    "col": p.col,
+                    "row": p.row,
+                    "weight": getattr(p, "weight", 1.0),
+                    "picked": p.picked,
+                    "delivered": p.delivered,
+                }
+                for p in terrain.parcels
+            ],
+            "stations": [
+                {
+                    "col": s.col,
+                    "row": s.row,
+                    "w": s.w,
+                    "h": s.h,
+                }
+                for s in terrain.stations
+            ],
+        }
+
+    def update(self, agents, parcels, now=None):
+        """
+        Advance centralized coordination for the current world state.
+
+        This is the ONLY place where CentralisedStrategy.step() is called.
+        """
+        if self.terrain is None:
+            return
+
+        self.strategy.step(
+            terrain=self.terrain,
+            agents=agents,
+            parcels=parcels,
+            now=now,
+        )
+
+    def _get_agent(self, agent_id: str):
+        """
+        Resolve an agent_id to a registered Drone instance.
+        """
+        return self.agents.get(agent_id)
+
+    def request_directive(self, agent_id: str) -> dict:
+        """
+        Handle a directive request from a drone agent.
+
+        This method represents the *only* legitimate interaction point between
+        a drone-side controller (AIAgentController) and the centralized
+        CommandCenter.
+
+        Conceptual contract:
+        --------------------
+        - The drone does NOT run the centralized strategy.
+        - The drone asks the CommandCenter for guidance.
+        - The CommandCenter decides whether it can respond, based on:
+            1) Agent existence
+            2) Network connectivity and remaining capacity
+        - If communication is possible, the CommandCenter:
+            a) Builds a global snapshot from the terrain
+            b) Delegates reasoning to CentralisedStrategy
+            c) Accounts for network cost AFTER the decision
+        - If communication is not possible, the drone is instructed to wait.
+
+        This preserves:
+        - Physical realism (range + bandwidth constraints)
+        - Clear authority boundaries
+        - Deterministic reasoning order (sense → decide → pay cost)
+
+        Parameters
+        ----------
+        agent_id : str
+            Unique identifier of the requesting drone agent.
+
+        Returns
+        -------
+        dict
+            A directive dictionary with at least a "mode" key.
+            Expected modes include:
+                - "plan" : contains a full execution plan
+                - "task" : assigns a specific parcel or task
+                - "wait" : agent should remain idle but alive
+                - "idle" : agent has no further role in the mission
+        """
+
+        # --------------------------------------------------
+        # 1. Resolve agent from registry
+        # --------------------------------------------------
+        agent = self._get_agent(agent_id)
+
+        if agent is None:
+            print(
+                f"[CC][REQUEST] agent_id={agent_id} "
+                f"status=UNKNOWN_AGENT → WAIT"
+            )
+            return {"mode": "wait"}
+
+        # --------------------------------------------------
+        # 2. Check communication feasibility
+        # --------------------------------------------------
+        can_comm = self.can_communicate(agent)
+
+        print(
+            f"[CC][REQUEST] agent_id={agent_id} "
+            f"resolved=True "
+            f"can_communicate={can_comm} "
+            f"cc_net={self.network.level:.2f} "
+            f"agent_net={agent.network.level:.2f}"
+        )
+
+        if not can_comm:
+            # Agent exists but cannot currently communicate
+            return {"mode": "wait"}
+
+        # --------------------------------------------------
+        # 3. Build authoritative global snapshot
+        # --------------------------------------------------
+        snapshot = self.snapshot()
+
+        print(
+            f"[CC][SNAPSHOT] agent_id={agent_id} "
+            f"agents={len(snapshot.get('agents', []))} "
+            f"parcels={len(snapshot.get('parcels', []))}"
+        )
+
+        # --------------------------------------------------
+        # 4. Delegate reasoning to centralized strategy
+        # --------------------------------------------------
+        decision = self.strategy.decide(snapshot, agent_id)
+
+        print(
+            f"[CC][DECISION] agent_id={agent_id} "
+            f"mode={decision.get('mode')}"
+        )
+
+        # --------------------------------------------------
+        # 5. Account for network cost (post-decision)
+        # --------------------------------------------------
+
+        if decision.get("mode") != "wait":
+            # Mark ACTIVE network usage
+            agent.network_active = True
+            self.consume_network(agent)
+
+        print(
+            f"[CC][DECISION] agent_id={agent_id} "
+            f"mode={decision.get('mode')}"
+        )
+
+        print(
+            f"[CC][NETWORK] agent_id={agent_id} "
+            f"cc_net_after={self.network.level:.2f} "
+            f"agent_net_after={agent.network.level:.2f}"
+        )
+
+        return decision
+
+    def register_agent(self, drone):
+        """
+        Register a drone with the Command Center.
+
+        This establishes the drone as a participant in centralized coordination.
+        """
+        self.agents[drone.agent_id] = drone
+        print(f"[CC][REGISTER] agent_id={drone.agent_id}")
+
+    def unregister_agent(self, drone):
+        self.agents.pop(drone.agent_id, None)
+        print(f"[CC][UNREGISTER] agent_id={drone.agent_id}")

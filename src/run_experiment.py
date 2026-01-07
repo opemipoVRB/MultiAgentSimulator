@@ -21,9 +21,12 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from flight_recorder import FlightRecorder
-from artifacts import Terrain, Drone, Parcel
+from artifacts import Terrain, Drone, Parcel, CommandCenter
 from controllers import HumanAgentController, AIAgentController, ControllerSwitcher
 from utils import load_image, scale_to_cell
+
+from src.strategies.centralised import CentralisedStrategy
+from src.strategies.naive import NaiveStrategy
 
 GRID_SIZE = 100
 SPEED = 420
@@ -163,6 +166,7 @@ class ExperimentRunnerGUI:
 
         # experiment metadata
         self.seed = int(time.time()) % (2 ** 31)
+        # GUI-controlled defaults
         self.parcels = 15
         self.planners = ["local"]
         self.run_id = str(uuid.uuid4())[:8]
@@ -339,17 +343,14 @@ class ExperimentRunnerGUI:
                         else:
                             parcels = max(min_parcels, parcels - 1)
                         typing = ""
-
-                    elif e.unicode and e.unicode.isdigit():
+                    elif e.type == pygame.KEYDOWN and e.unicode.isdigit():
                         typing += e.unicode
-                        try:
-                            v = int(typing)
-                            if active_field == "agents":
-                                agents = max(min_agents, min(max_agents, v))
-                            else:
-                                parcels = max(min_parcels, min(max_parcels, v))
-                        except ValueError:
-                            typing = ""
+                        v = int(typing)
+
+                        if active_field == "agents":
+                            agents = max(min_agents, min(max_agents, v))
+                        else:
+                            parcels = max(min_parcels, min(max_parcels, v))
 
             # -------- render --------
             self.screen.fill((40, 44, 52))
@@ -502,12 +503,7 @@ class ExperimentRunnerGUI:
         keys = pygame.key.get_pressed()
         return keys[pygame.K_RETURN]
 
-    def _load_or_create_experiment(
-            self,
-            n_agents: int,
-            n_parcels: int,
-            selected_planner: str,
-    ):
+    def _load_or_create_experiment(self):
         """
         Load the most recent unfinished experiment if one exists.
         User MUST explicitly choose whether to resume or discard it.
@@ -695,41 +691,6 @@ class ExperimentRunnerGUI:
             encoding="utf-8",
         )
 
-    def _persist_partial_results(
-            self,
-            idx: int,
-            planner_name: str,
-            metrics: MetricsAccumulator,
-            flight_recorder: FlightRecorder,
-            steps: int,
-            agents: List[Drone],
-    ):
-        # finalize metrics with current state
-        metrics.finalize(
-            steps,
-            agents[0].power.capacity if agents else 100.0,
-            agents[0].power.level if agents else 0.0,
-        )
-
-        # export flight data
-        flight_data = flight_recorder.export()
-
-        artifact_paths = self._write_flight_artifacts(
-            run_id=self.experiment["run_id"],
-            planner=planner_name,
-            flight_data=flight_data,
-        )
-
-        self.experiment["results"].append({
-            "planner": planner_name,
-            "seed": self.experiment["seed"],
-            "metrics": metrics.as_dict(),
-            "artifacts": artifact_paths,
-            "terminated": "aborted",
-            "steps_executed": steps,
-        })
-
-        self._write_experiment_json()
 
     def _finalize_experiment_file(self):
         self.experiment["status"] = "completed"
@@ -882,7 +843,7 @@ class ExperimentRunnerGUI:
         rows = self.screen_size[1] // GRID_SIZE
         center_col = max(2, cols // 2 - 2)
         center_row = max(2, rows // 2 - 2)
-        terrain.add_station(center_col, center_row, w=4, h=4)
+        terrain.add_station(center_col, center_row, w=5, h=5)
 
         # ----------------------------
         # Recreate parcels
@@ -968,6 +929,7 @@ class ExperimentRunnerGUI:
                         f"[RESTORE] WARNING: Agent {agent_id} should be carrying parcel {carrying_id_str} but it wasn't found")
 
             terrain.register_agent_cell(drone, drone.col, drone.row)
+            terrain.agents[drone.agent_id] = drone
             agents.append(drone)
 
             print(f"[RESTORE] Agent {agent_id} at ({drone.col},{drone.row}) - "
@@ -1143,6 +1105,7 @@ class ExperimentRunnerGUI:
 
             agents[agent_def["id"]] = drone
             terrain.register_agent_cell(drone, start_cell[0], start_cell[1])
+            terrain.agents[drone.agent_id] = drone
 
         return agents, 0, None
 
@@ -1172,7 +1135,8 @@ class ExperimentRunnerGUI:
         rows = self.screen_size[1] // GRID_SIZE
         center_col = max(2, cols // 2 - 2)
         center_row = max(2, rows // 2 - 2)
-        terrain.add_station(center_col, center_row, w=4, h=4)
+        s = self.experiment["station"]
+        terrain.add_station(s["col"], s["row"], w=s["w"], h=s["h"])
 
         # 2. Parcels (schema-driven)
         for pdef in self.experiment.get("parcels", []):
@@ -1283,6 +1247,122 @@ class ExperimentRunnerGUI:
 
         return True
 
+    def _finalize_strategy(
+            self,
+            *,
+            idx: int,
+            status: str,
+            planner_name: str,
+            strategy_name: str,
+            strategy_mode: str,
+            steps: int,
+            metrics: MetricsAccumulator,
+            flight_recorder: FlightRecorder,
+    ):
+        """
+        Finalize exactly one strategy run.
+
+        This is the ONLY place allowed to:
+          - finalize metrics
+          - export artifacts
+          - append to experiment["results"]
+          - update strategy state
+          - advance experiment progress
+          - emit experiment-level lifecycle logs
+        """
+
+        assert status in {"completed", "aborted", "failed"}, f"Invalid status: {status}"
+
+        # -------------------------------------------------
+        # ENTRY LOG
+        # -------------------------------------------------
+        print(
+            f"[FINALIZE] Strategy {idx} '{strategy_name}' | "
+            f"mode={strategy_mode} | planner={planner_name} | "
+            f"status={status} | steps={steps}"
+        )
+
+        # -------------------------------------------------
+        # Finalize metrics (EXACTLY ONCE)
+        # -------------------------------------------------
+        metrics.finalize(
+            steps,
+            battery_capacity=metrics.fields["battery_capacity"],
+            battery_level=metrics.fields["battery_capacity"] - metrics.total_energy_consumed,
+        )
+
+        print(
+            f"[FINALIZE] Metrics finalized | "
+            f"energy_used={metrics.total_energy_consumed:.3f}"
+        )
+
+        # -------------------------------------------------
+        # Export flight artifacts
+        # -------------------------------------------------
+        flight_data = flight_recorder.export()
+        artifact_paths = self._write_flight_artifacts(
+            run_id=self.experiment["run_id"],
+            planner=planner_name,
+            flight_data=flight_data,
+        )
+
+        print(
+            f"[FINALIZE] Artifacts written | "
+            f"keys={list(artifact_paths.keys())}"
+        )
+
+        # -------------------------------------------------
+        # Append result (EXACTLY ONCE)
+        # -------------------------------------------------
+        self.experiment["results"].append({
+            "strategy_index": idx,
+            "strategy_name": strategy_name,
+            "strategy_mode": strategy_mode,
+            "planner": planner_name,
+            "seed": self.experiment["seed"],
+            "status": status,
+            "steps_executed": steps,
+            "metrics": metrics.as_dict(),
+            "artifacts": artifact_paths,
+        })
+
+        print(
+            f"[FINALIZE] Result appended | "
+            f"results_count={len(self.experiment['results'])}"
+        )
+
+        # -------------------------------------------------
+        # Update strategy bookkeeping
+        # -------------------------------------------------
+        self.experiment["strategies"][idx]["status"] = status
+        self.experiment["strategies"][idx]["snapshot"] = None
+
+        print(
+            f"[FINALIZE] Strategy state updated | "
+            f"strategy_status={status}"
+        )
+
+        # -------------------------------------------------
+        # Advance experiment progress
+        # -------------------------------------------------
+        self.experiment["current_index"] = idx + 1
+
+        if self.experiment["current_index"] >= len(self.experiment["strategies"]):
+            self.experiment["status"] = "completed"
+            print("[EXPERIMENT] All strategies completed")
+        else:
+            self.experiment["status"] = "in_progress"
+            print(
+                f"[EXPERIMENT] Moving to next strategy: "
+                f"{self.experiment['current_index']}"
+            )
+
+        # -------------------------------------------------
+        # Persist experiment state
+        # -------------------------------------------------
+        print("[FINALIZE] Persisting experiment state to disk")
+        self._write_experiment_json()
+
     def run(self):
         # -------------------------------------------------
         # Splash + setup phase (single abort boundary)
@@ -1290,14 +1370,20 @@ class ExperimentRunnerGUI:
         self.show_splash(timeout=1.0)
 
         # -------------------------------------------------
+        # Initialize setup variables defensively
+        # -------------------------------------------------
+        n_agents = None
+        n_parcels = None
+        selected_planner = None
+
+        # -------------------------------------------------
         # Attempt resume BEFORE any setup UI
         # -------------------------------------------------
-        self._load_or_create_experiment(
-            n_agents=None,
-            n_parcels=None,
-            selected_planner=None,
-        )
+        self._load_or_create_experiment()
 
+        # -------------------------------------------------
+        # Fresh setup path (only if not resumed)
+        # -------------------------------------------------
         if not getattr(self, "_resumed", False):
             while True:
                 try:
@@ -1305,16 +1391,17 @@ class ExperimentRunnerGUI:
                         initial_agents=1,
                         initial_parcels=self.parcels,
                     )
+                    # Persist for downstream use
                     self.parcels = n_parcels
+
                     selected_planner = self.show_setup_and_planner_select()
-                    self._load_or_create_experiment(
-                        n_agents=n_agents,
-                        n_parcels=n_parcels,
-                        selected_planner=selected_planner,
-                    )
+
+                    self._load_or_create_experiment()
                     break
+
                 except RuntimeError:
                     continue
+
                 except SystemExit:
                     print("[EXPERIMENT] User aborted at setup")
                     return
@@ -1323,25 +1410,38 @@ class ExperimentRunnerGUI:
         # Commit setup choices to experiment schema
         # -------------------------------------------------
         if not getattr(self, "_resumed", False):
-            self.parcels = n_parcels
-            planners = [selected_planner]
+            assert n_parcels is not None, "n_parcels must be set for new experiment"
+            assert selected_planner is not None, "selected_planner must be set for new experiment"
 
-            # Create new experiment with all required fields
+            strategies = [
+                {
+                    "name": "naive_decentralized",
+                    "mode": "decentralized",
+                    "planner": selected_planner,
+                    "snapshot": None,
+                    "status": "pending",
+                },
+                {
+                    "name": "centralized_cc",
+                    "mode": "centralized",
+                    "planner": selected_planner,
+                    "snapshot": None,
+                    "status": "pending",
+                },
+            ]
+
             self.experiment = {
                 "schema_version": self.SCHEMA_VERSION,
                 "run_id": self.run_id,
                 "seed": self.seed,
-                "planners": planners,
-                "parcels": [],  # Will be populated below
+                "parcels": [],
                 "agents": [],
                 "comm_config": self.default_comm_config.copy(),
                 "current_index": 0,
                 "status": "in_progress",
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                 "results": [],
-                "strategies": [
-                    {"planner": p, "snapshot": None, "status": "pending"} for p in planners
-                ]
+                "strategies": strategies,
             }
 
             # Generate parcel positions
@@ -1350,10 +1450,20 @@ class ExperimentRunnerGUI:
             center_col = max(2, cols // 2 - 2)
             center_row = max(2, rows // 2 - 2)
 
-            # Forbidden cells around the station
+            station_spec = {
+                "col": center_col,
+                "row": center_row,
+                "w": 5,
+                "h": 5,
+            }
+            self.experiment["station"] = station_spec
+
+            s = self.experiment["station"]
+
+            # Forbidden cells inside the station footprint
             forbidden_cells = []
-            for r in range(center_row, center_row + 4):
-                for c in range(center_col, center_col + 4):
+            for r in range(s["row"], s["row"] + s["h"]):
+                for c in range(s["col"], s["col"] + s["w"]):
                     forbidden_cells.append((c, r))
 
             parcel_positions = deterministic_parcel_positions(
@@ -1401,25 +1511,61 @@ class ExperimentRunnerGUI:
         # STRATEGY LOOP
         # -------------------------------------------------
         for idx, strategy in enumerate(self.experiment["strategies"]):
+            print("Strategies", self.experiment["strategies"])
             if idx < int(self.experiment.get("current_index", 0)):
                 continue
+            print(f"self.experiment[\"strategies\"] {self.experiment['strategies']}")
 
             # Reset completion wait counter for this strategy
             if hasattr(self, '_completion_wait_counter'):
                 del self._completion_wait_counter
+            strategy_name = strategy.get("name", f"strategy_{idx}")
+            strategy_mode = strategy.get("mode", "unknown")
             planner_name = strategy["planner"]
-            print(f"[EXPERIMENT] Running planner '{planner_name}' ({idx + 1}/{len(self.experiment['strategies'])})")
+            print(f"[EXPERIMENT] Running planner '{planner_name}' ({idx + 1}/{len(self.experiment['strategies'])})"
+                  f"Current Strategy {strategy_name}"
+                  f"Strategy mode {strategy_mode}")
 
             self._configure_planner(planner_name)
 
             snapshot = strategy.get("snapshot")
-            # In the run method, update the _setup_scene call:
             try:
                 terrain, agents, pre_steps, all_parcels = self._setup_scene(snapshot)
-                # assert pre_steps > 0, "Resume expected non-zero steps but got 0"
+
+                # strategy_mode = "naive"  # strategy.get("mode", "decentralized")
+                # strategy_mode = "centralized"
+                strategy_mode = strategy.get("mode", "decentralized")
+                if strategy_mode == "centralized":
+                    station = terrain.stations[0]
+                    cc_col = station.col + station.w // 2
+                    cc_row = station.row + station.h // 2
+
+                    command_center = CommandCenter(
+                        col=cc_col,
+                        row=cc_row,
+                        grid_size=GRID_SIZE,
+                        network_capacity=100.0,
+                        network_range=8,
+                        image_path=str(GRAPHICS_DIR / "command_center.png"),
+                    )
+
+                    terrain.command_center = command_center
+                    terrain.command_center.bind_terrain(terrain)
+                    if terrain.command_center:
+                        for drone in agents:
+                            terrain.command_center.register_agent(drone)
+
+                    strategy = CentralisedStrategy()
+
+                else:
+                    terrain.command_center = None
+
+                    strategy = NaiveStrategy(num_trials=10)
+
             except AgentSpawnError as e:
                 self._show_error_and_restart_setup(str(e))
-                return  # exit run(), caller restarts setup
+                return
+            # exit run(), caller restarts setup
 
             if terrain is None:
                 return  # safely return to GUI loop
@@ -1455,12 +1601,15 @@ class ExperimentRunnerGUI:
                 for i, drone in enumerate(agents):
                     agent_id = self.experiment["agents"][i]["id"]
                     drone.agent_id = agent_id
+                    if terrain.command_center:
+                        terrain.command_center.register_agent(drone)
                     human = HumanAgentController(drone, terrain)
                     ai = AIAgentController(
-                        drone,
-                        terrain,
-                        enable_reactive_fallback=True,
+                        drone=drone,
+                        terrain=terrain,
+                        strategy=strategy,
                         flight_recorder=flight_recorder
+
                     )
                     print("Drone", drone)
                     print("Drone ID", drone.agent_id)
@@ -1591,6 +1740,9 @@ class ExperimentRunnerGUI:
                             for p in invalid_parcels:
                                 p.delivered = True
                                 p.picked = False
+                                station = terrain.get_station_at(p.col, p.row)
+                                if station:
+                                    station.register_delivery((p.col, p.row))
                                 print(f"[ABORT-CHECK] Fixed parcel at ({int(p.col)},{int(p.row)}) to delivered=True")
 
                         # Check again after fixing invalid parcels
@@ -1602,34 +1754,16 @@ class ExperimentRunnerGUI:
                             if all_delivered_now and no_carrying_now:
                                 print(
                                     "[EXPERIMENT] Mission effectively complete! Marking as completed instead of aborted.")
-
-                                # Mission is complete, mark as completed
-                                self.experiment["strategies"][idx]["status"] = "completed"
-                                self.experiment["strategies"][idx]["snapshot"] = None
-
-                                self.experiment["current_index"] = idx + 1
-                                if self.experiment["current_index"] >= len(self.experiment["strategies"]):
-                                    self.experiment["status"] = "completed"
-                                else:
-                                    self.experiment["status"] = "in_progress"
-
-                                metrics.finalize(steps, agents[0].power.capacity, agents[0].power.level)
-
-                                flight_data = flight_recorder.export()
-                                artifact_paths = self._write_flight_artifacts(
-                                    run_id=self.experiment["run_id"],
-                                    planner=planner_name,
-                                    flight_data=flight_data,
+                                self._finalize_strategy(
+                                    idx=idx,
+                                    status="completed",
+                                    planner_name=planner_name,
+                                    strategy_name=strategy_name,
+                                    strategy_mode=strategy_mode,
+                                    steps=steps,
+                                    metrics=metrics,
+                                    flight_recorder=flight_recorder,
                                 )
-
-                                self.experiment["results"].append({
-                                    "planner": planner_name,
-                                    "seed": self.experiment["seed"],
-                                    "metrics": metrics.as_dict(),
-                                    "artifacts": artifact_paths,
-                                })
-
-                                self._write_experiment_json()
                                 print("[EXPERIMENT] Mission marked as completed successfully")
 
                                 # Show completion message briefly before returning
@@ -1661,7 +1795,8 @@ class ExperimentRunnerGUI:
                                     completion_shown = True
 
                                 if completion_shown:
-                                    return  # Exit the run method entirely
+                                    strategy_finished = True
+                                    break  # break out of the simulation loop ONLY
                             else:
                                 print("[EXPERIMENT] Mission not complete, proceeding with abort...")
                                 # Fall through to abort logic below
@@ -1676,20 +1811,20 @@ class ExperimentRunnerGUI:
                             pass
 
                         self.experiment["strategies"][idx]["snapshot"] = snap
-                        self.experiment["strategies"][idx]["status"] = "aborted"
-                        self.experiment["status"] = "aborted"
-                        self.experiment["current_index"] = idx
 
-                        self._persist_partial_results(
+                        self._finalize_strategy(
                             idx=idx,
+                            status="aborted",
                             planner_name=planner_name,
+                            strategy_name=strategy_name,
+                            strategy_mode=strategy_mode,
+                            steps=steps,
                             metrics=metrics,
                             flight_recorder=flight_recorder,
-                            steps=steps,
-                            agents=agents,
                         )
-                        print("[EXPERIMENT] Mission aborted mid-run")
 
+                        print("[EXPERIMENT] Mission aborted mid-run")
+                        strategy_finished = True
                         break
 
                     dt = self.clock.tick(60) / 1000.0
@@ -1811,18 +1946,25 @@ class ExperimentRunnerGUI:
                     # 3. HARD FAILURE: mission impossible
                     # ---------------------------------------------
                     if not alive_agents and not self.all_parcels_delivered(terrain):
-                        # No agents left and parcels remain
-                        self.experiment["strategies"][idx]["status"] = "failed"
-                        self.experiment["status"] = "failed"
-                        self.experiment["current_index"] = idx + 1
 
-                        self._write_experiment_json()
+                        self._finalize_strategy(
+                            idx=idx,
+                            status="failed",
+                            planner_name=planner_name,
+                            strategy_name=strategy_name,
+                            strategy_mode=strategy_mode,
+                            steps=steps,
+                            metrics=metrics,
+                            flight_recorder=flight_recorder,
+                        )
+
                         break
 
                     # ---------------------------------------------
                     # 4. SUCCESS CONDITION - NEW PARKING-AWARE CHECK
                     # ---------------------------------------------
                     if self.mission_exhausted(terrain, agents):
+                        status = "completed"
                         print(f"[DEBUG] Mission exhausted condition met at step {steps}")
 
                         # Add a brief wait to ensure all agents are settled at the station
@@ -1839,39 +1981,17 @@ class ExperimentRunnerGUI:
 
                         print(f"[DEBUG] All conditions confirmed. Marking strategy as completed.")
 
-                        # Mark strategy as completed and clear snapshot
-                        self.experiment["strategies"][idx]["status"] = "completed"
-                        self.experiment["strategies"][idx]["snapshot"] = None  # Clear snapshot when completed
-
-                        # Move to next strategy or complete experiment
-                        self.experiment["current_index"] = idx + 1
-
-                        if self.experiment["current_index"] >= len(self.experiment["strategies"]):
-                            self.experiment["status"] = "completed"
-                            print("[EXPERIMENT] All strategies completed")
-                        else:
-                            self.experiment["status"] = "in_progress"
-                            print(f"[EXPERIMENT] Moving to next strategy: {self.experiment['current_index']}")
-
-                        # Finalize metrics and save results
-                        metrics.finalize(steps, agents[0].power.capacity, agents[0].power.level)
-
                         # Export flight data
-                        flight_data = flight_recorder.export()
-                        artifact_paths = self._write_flight_artifacts(
-                            run_id=self.experiment["run_id"],
-                            planner=planner_name,
-                            flight_data=flight_data,
+                        self._finalize_strategy(
+                            idx=idx,
+                            status=status,
+                            planner_name=planner_name,
+                            strategy_name=strategy_name,
+                            strategy_mode=strategy_mode,
+                            steps=steps,
+                            metrics=metrics,
+                            flight_recorder=flight_recorder,
                         )
-
-                        self.experiment["results"].append({
-                            "planner": planner_name,
-                            "seed": self.experiment["seed"],
-                            "metrics": metrics.as_dict(),
-                            "artifacts": artifact_paths,
-                        })
-
-                        self._write_experiment_json()
 
                         # BREAK OUT OF SIMULATION LOOP IMMEDIATELY
                         strategy_finished = True
@@ -1890,33 +2010,21 @@ class ExperimentRunnerGUI:
                     terrain.draw(self.screen)
                     for drone in agents:
                         drone.draw(self.screen, self.images)
+                        # ----------------------------
+                        # Drone network pulse (visual only)
+                        # ----------------------------
+                        if strategy_mode in ("naive", "novel", "centralized"):
+                            drone.draw_network_pulse(
+                                self.screen,
+                                min_cells=1,
+                                max_cells=3,
+                            )
 
                     pygame.display.flip()
 
                 if aborted:
+                    print("[EXPERIMENT] Simulation loop exited due to abort")
                     break
-
-                metrics.finalize(steps, agents[0].power.capacity, agents[0].power.level)
-
-                # -------------------------------------------------
-                # >>> FLIGHT RECORDER: export + persist
-                # -------------------------------------------------
-                flight_data = flight_recorder.export()
-
-                artifact_paths = self._write_flight_artifacts(
-                    run_id=self.experiment["run_id"],
-                    planner=planner_name,
-                    flight_data=flight_data,
-                )
-
-                self.experiment["results"].append({
-                    "planner": planner_name,
-                    "seed": self.experiment["seed"],
-                    "metrics": metrics.as_dict(),
-                    "artifacts": artifact_paths,
-                })
-
-                self._write_experiment_json()
 
                 # -------------------------------------------------
                 # POST-RUN CLEANUP
@@ -1932,7 +2040,7 @@ class ExperimentRunnerGUI:
                     while time.time() - start_time < completion_time:
                         for e in pygame.event.get():
                             if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
-                                return
+                                break
 
                         # Redraw final world state
                         self.screen.fill((192, 192, 192))
@@ -1952,7 +2060,7 @@ class ExperimentRunnerGUI:
                         pygame.display.flip()
                         self.clock.tick(30)
 
-                    return  # Exit after showing completion
+                    break  # break out of strategy loop, not run()
                 else:
                     # Only show post-run inspection if mission was aborted
                     print("[EXPERIMENT] Entering post-run inspection mode. Press ESC to exit.")
@@ -1978,9 +2086,6 @@ class ExperimentRunnerGUI:
 
                         pygame.display.flip()
                         self.clock.tick(30)
-                return
-
-
             finally:
                 try:
                     flight_recorder.finalize()

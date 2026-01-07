@@ -24,15 +24,36 @@ from .utils import manhattan, est_cost_cells
 
 class NaiveStrategy(BaseStrategy):
     """
-    Naive snapshot-based single-agent planning strategy with operational robustness.
+        Naive snapshot-based single-agent planning strategy
+        with operational robustness and local autonomy.
 
-    Key Fixes Applied:
-    1. Confidence formula reworked to be more reasonable (sublinear risk growth)
-    2. No dynamic thresholds - maintains clean abstraction
-    3. Clear logging that shows exact calculations
-    4. Proper handling of edge cases without special hacks
-    5. Confidence-based selection with clear rationale
-    """
+        This strategy assumes a fully decentralized execution model
+        in which each agent is responsible for completing tasks
+        without external coordination.
+
+        Key characteristics:
+        --------------------
+        - Single-agent planning based on local snapshots
+        - Monte Carlo greedy rollouts with energy-awareness
+        - Explicit operational confidence estimation
+        - Robustness-focused plan selection
+
+        Autonomy model:
+        ---------------
+        The agent is allowed to adapt locally during execution.
+
+        If execution constraints invalidate a planned step:
+          - the controller MAY substitute a feasible alternative
+          - confidence is revised using posterior evidence
+          - execution continues without external intervention
+
+        This makes the strategy resilient under uncertainty,
+        but unsuitable for coordinated multi-agent task allocation.
+
+        Reactive fallback is therefore ENABLED by design.
+        """
+    enable_reactive_fallback = True
+    requires_plan_completion_before_requery = False
 
     def __init__(self, num_trials: int = 10):
         """
@@ -49,6 +70,21 @@ class NaiveStrategy(BaseStrategy):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def decide(self, snapshot: Dict, agent_id: str = None) -> Dict:
+        plan_obj = self.request_plan(snapshot)
+
+        if not plan_obj.get("plan"):
+            return {
+                "mode": "idle",
+                "reason": "no_feasible_plan",
+            }
+
+        return {
+            "mode": "plan",
+            "plan": plan_obj,
+        }
+
     def request_plan(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         """
         Produce a single open-loop plan with quantified operational confidence.

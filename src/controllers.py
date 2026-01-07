@@ -119,8 +119,7 @@ class AIAgentController(BaseAgentController):
       - Prefers free cells inside nearest station and avoids repeating the same station cell when possible.
     """
 
-    def __init__(self, drone, terrain, search_radius: Optional[int] = None, enable_reactive_fallback: bool = False,
-                 flight_recorder=None):
+    def __init__(self, drone, terrain, strategy, flight_recorder=None):
         super().__init__(drone, terrain)
 
         self.state = "idle"
@@ -129,7 +128,6 @@ class AIAgentController(BaseAgentController):
         self.no_feasible_plan = False
         self._no_plan_battery_threshold = 15.0
         self.cooldown = 0.0
-        self.search_radius = search_radius
         self._last_plan_time = 0.0
         self._last_action_time = 0.0
         self.last_narration: Optional[str] = None
@@ -138,11 +136,15 @@ class AIAgentController(BaseAgentController):
         self.parked = False
         self.parking_in_progress = False
         self.parking_target = None  # (col, row)
-        self.enable_reactive_fallback = enable_reactive_fallback
         self.plan_confidence: float = 0.0
         self.flight_recorder = flight_recorder
+        self.strategy = strategy
 
         print(f"[INIT] AI controller for {drone.agent_id}, parked={self.parked}")
+        print(
+            f"[INIT] AI controller for {drone.agent_id} "
+            f"strategy={type(strategy).__name__}"
+        )
 
     # ---------------------------
     # Planner interaction
@@ -180,85 +182,126 @@ class AIAgentController(BaseAgentController):
             )
         return snap
 
-    def _request_plan(self):
-        """Ask PLANNER for a plan given current snapshot. Handles parsing and some truncation for narration."""
-        if self.plan:
-            return
+    def _trim_narration(self, text: str) -> Optional[str]:
+        if not text:
+            return None
 
-        snap = self._make_snapshot()
-        try:
-            plan_obj = STRATEGY.request_plan(snap)
+        sentences = [
+            s.strip()
+            for s in text.replace("\n", " ").split(".")
+            if s.strip()
+        ]
 
-            # Capture PRIOR confidence exactly once
-            if isinstance(plan_obj, dict) and plan_obj.get("plan"):
-                self.plan_confidence = float(plan_obj.get("confidence", self.plan_confidence))
-                print(
-                    f"[PLAN-PRIOR] agent={self.drone.agent_id} "
-                    f"confidence={self.plan_confidence:.3f}"
-                )
+        truncated = ". ".join(sentences[:3])
+        if len(truncated) > 300:
+            truncated = truncated[:297].rstrip() + "..."
 
-            else:
-                # No plan = no belief update
-                print(
-                    f"[PLAN-PRIOR] agent={self.drone.agent_id} "
-                    f"no plan returned → confidence unchanged"
-                )
+        return truncated
 
+    def _load_plan(self, plan_obj: Dict):
+        """
+        Install a strategy-provided plan into the controller.
 
-        except Exception as ex:
-            print("[PLANNER] request failed:", ex)
-            self.plan = []
-            self.plan_idx = 0
-            self.last_narration = None
-            self._last_plan_time = time.time()
+        This method is the SINGLE commit point where:
+          - execution state is initialized
+          - confidence is captured
+          - narration is prepared
+          - flight recording (if any) is triggered
+
+        The strategy has already decided WHAT to do.
+        This method only handles HOW the agent will execute it.
+        """
+
+        # -------------------------------------------------
+        # Normalize input (defensive against legacy planners)
+        # -------------------------------------------------
+        if isinstance(plan_obj, list):
+            # Legacy shape: raw list of steps
+            plan_obj = {
+                "plan": plan_obj,
+                "confidence": self.plan_confidence,
+                "narration": None,
+                "strategy": "unknown",
+            }
+
+            print(
+                f"[PLAN-WARN] agent={self.drone.agent_id} "
+                f"received legacy plan list. Coercing into plan envelope."
+            )
+
+        if not isinstance(plan_obj, dict):
+            print(
+                f"[PLAN-ERROR] agent={self.drone.agent_id} "
+                f"invalid plan object type={type(plan_obj)}. Ignoring."
+            )
             self.no_feasible_plan = True
-            self.plan_confidence = 0.0
             return
 
-        plan_list = plan_obj.get("plan", []) if isinstance(plan_obj, dict) else []
-        parsed = []
+        # -------------------------------------------------
+        # Parse plan steps
+        # -------------------------------------------------
+        plan_list = plan_obj.get("plan", [])
+        parsed: List[Dict] = []
 
         for step in plan_list:
             try:
                 pickup = (int(step["pickup"][0]), int(step["pickup"][1]))
                 dropoff = (int(step["dropoff"][0]), int(step["dropoff"][1]))
                 weight = float(step.get("weight", 1.0))
-                parsed.append({"pickup": pickup, "dropoff": dropoff, "weight": weight})
+
+                parsed.append(
+                    {
+                        "pickup": pickup,
+                        "dropoff": dropoff,
+                        "weight": weight,
+                    }
+                )
             except Exception:
                 continue
 
+        # -------------------------------------------------
+        # Install execution state
+        # -------------------------------------------------
         self.plan = parsed
         self.plan_idx = 0
-        self._last_plan_time = time.time()
         self.no_feasible_plan = not bool(self.plan)
+        self._last_plan_time = time.time()
 
-        # ---------------------------------------------
-        # Record initial plan (PRIOR)
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # Capture metadata
+        # -------------------------------------------------
+        self.plan_confidence = float(
+            plan_obj.get("confidence", self.plan_confidence)
+        )
+
+        raw_narration = plan_obj.get("narration", "")
+        self.last_narration = self._trim_narration(raw_narration)
+
+        # -------------------------------------------------
+        # Flight recorder (PRIOR belief)
+        # -------------------------------------------------
         if self.flight_recorder and self.plan:
             self.flight_recorder.record_initial_plan(
                 agent_id=self.drone.agent_id,
                 plan=self.plan,
                 confidence=self.plan_confidence,
-                projected_battery=plan_obj.get("projected_battery"),
-                step=0,  # first plan is pre-execution
+                projected_battery=plan_obj.get("projected_battery_remaining"),
+                step=0,
                 sim_time=0.0,
             )
 
-        # narration trimming for UI
-        raw_n = plan_obj.get("narration", "") if isinstance(plan_obj, dict) else ""
-        sentences = [s.strip() for s in raw_n.replace("\n", " ").split(".") if s.strip()]
-        truncated = ". ".join(sentences[:3])
-        if len(truncated) > 300:
-            truncated = truncated[:297].rstrip() + "..."
-        self.last_narration = truncated
-
-        strategy = plan_obj.get("strategy", "unknown") if isinstance(plan_obj, dict) else "unknown"
-
+        # -------------------------------------------------
+        # Debug logging
+        # -------------------------------------------------
         try:
-            print("[PLANNER] strategy:", strategy)
-            print("[PLANNER] plan received:", self.plan)
-            print("[PLANNER] narration:", self.last_narration)
+            print(
+                f"[PLAN-COMMIT] agent={self.drone.agent_id} "
+                f"steps={len(self.plan)} "
+                f"confidence={self.plan_confidence:.3f} "
+                f"strategy={plan_obj.get('strategy', 'unknown')}"
+            )
+            if self.last_narration:
+                print(f"[PLAN-NARRATION] {self.last_narration}")
         except Exception:
             pass
 
@@ -278,7 +321,7 @@ class AIAgentController(BaseAgentController):
         current step with a feasible alternative before advancing.
         """
 
-        if self.enable_reactive_fallback:
+        if getattr(self.strategy, "enable_reactive_fallback", False):
             progress = {
                 "current_cell": (int(self.drone.col), int(self.drone.row)),
                 "battery_pct": float(self.drone.power.percent()),
@@ -661,18 +704,37 @@ class AIAgentController(BaseAgentController):
         # -----------------------------------------------
         # Request plan exactly once (open-loop)
         # -----------------------------------------------
+        # -----------------------------------------------
+        # Strategy decision (single entry point)
+        # -----------------------------------------------
         if not self.plan and not self.no_feasible_plan:
+            if self.strategy.requires_plan_completion_before_requery:
+                if self.state != "idle":
+                    return
 
-            # mission-complete short-circuit
-            if not self.terrain.has_undelivered_parcels():
+            if self.terrain.command_center:
+                decision = self.terrain.command_center.request_directive(
+                    self.drone.agent_id
+                )
+            else:
+                decision = self.strategy.decide(self._make_snapshot())
+            mode = decision.get("mode")
+
+            if mode == "plan":
+                self._load_plan(decision["plan"])
+
+            elif mode == "task":
+                self.current_task = decision["parcel_id"]
+            elif mode == "wait":
+                # Stay alive, do NOT mark no_feasible_plan
+                print(f"AI agent {self.drone.agent_id} Controller Waiting")
+                return
+            elif mode == "idle":
                 self.no_feasible_plan = True
                 return
+            else:
+                raise RuntimeError(f"Unknown strategy mode: {mode}")
 
-            self._request_plan()
-
-            if not self.plan:
-                self.no_feasible_plan = True
-                return
         # -----------------------------------------------
         # Handle NO FEASIBLE PLAN → REQUEST PARKING
         # -----------------------------------------------
