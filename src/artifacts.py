@@ -1,63 +1,29 @@
 # src/artifacts.py
-
-
 import random
 import math
 import heapq
-from typing import List, Tuple, Optional, Iterable
-
+from typing import List, Tuple, Optional, Iterable, Dict
+from resources import PowerResource, NetworkResource
 from collections import defaultdict, deque
 import pygame
-
-
-# -------------------------
-# Resource classes
-# -------------------------
-class AgentResource:
-    """Base resource class for agents (Power, Network, ...)."""
-
-    def __init__(self, capacity: float):
-        self.capacity = float(capacity)
-        self.level = float(capacity)
-
-    def percent(self) -> float:
-        if self.capacity <= 0:
-            return 0.0
-        return max(0.0, min(100.0, (self.level / self.capacity) * 100.0))
-
-    def is_depleted(self) -> bool:
-        return self.level <= 0.0
-
-    def recharge(self, amount: float):
-        self.level = min(self.capacity, self.level + float(amount))
-
-    def consume(self, amount: float):
-        """Consume amount (not percent). Negative values will recharge."""
-        self.level -= float(amount)
-        if self.level < 0.0:
-            self.level = 0.0
-
-
-class PowerResource(AgentResource):
-    """Power resource measured in 'energy units'. Default capacity = 100."""
-
-    def __init__(self, capacity: float = 100.0):
-        super().__init__(capacity)
-
-
-class NetworkResource(AgentResource):
-    """Placeholder for future network/signal modeling."""
-
-    def __init__(self, capacity: float = 100.0):
-        super().__init__(capacity)
+import uuid
+import time
 
 
 # -------------------------
 # World artifacts
 # -------------------------
+
+
 class Parcel:
-    def __init__(self, col: int, row: int, grid_size: int, weight: float = 1.0):
+    def __init__(self, col: int, row: int, grid_size: int):
         """
+         Inanimate world object representing a deliverable parcel.
+
+        Parcels do not have agency or control logic. They only expose
+        physical state (position, picked, delivered) which is interpreted
+        and enforced by the Terrain.
+
         weight: relative weight scalar that increases energy cost when carried.
         """
         self.col = int(col)
@@ -66,7 +32,39 @@ class Parcel:
         self.pos = pygame.Vector2(self.col * grid_size + grid_size / 2, self.row * grid_size + grid_size / 2)
         self.picked = False
         self.delivered = False
-        self.weight = float(weight)
+        self.weight = self._sample_weight()
+        self.id = str(uuid.uuid4())[:8]
+
+    # -------------------------
+    # Physical presence helpers
+    # -------------------------
+
+    @staticmethod
+    def _sample_weight() -> float:
+        return random.uniform(0.5, 2.0)
+
+    def place_at(self, col: int, row: int):
+        """
+        Commit this parcel to a physical grid cell.
+        This is used when a drone drops the parcel back into the world.
+        """
+        self.col = int(col)
+        self.row = int(row)
+        self.pos = pygame.Vector2(
+            self.col * self.grid_size + self.grid_size / 2,
+            self.row * self.grid_size + self.grid_size / 2
+        )
+
+    def remove_from_world(self):
+        """
+        Mark this parcel as no longer physically present in the world.
+
+        This corresponds to the parcel being picked up and carried
+        by a drone. Terrain is expected to unregister the parcel
+        separately.
+        :return:
+        """
+        self.picked = True
 
     def draw(self, surf, parcel_img=None, parcel_scale=0.7):
         # Always draw delivered parcels, but visually distinct (they are not pickable)
@@ -107,25 +105,33 @@ class Drone:
     """
 
     # energy cost constants (tuneable)
-    BASE_COST_PER_CELL = 0.2      # energy units per cell travelled (empty)
-    WEIGHT_FACTOR = 0.5           # additional factor per unit weight when carrying
-    PICK_DROP_COST = 0.7          # energy units for a pick/drop (base) multiplied by weight factor
+    BASE_COST_PER_CELL = 0.2  # energy units per cell travelled (empty)
+    WEIGHT_FACTOR = 0.5  # additional factor per unit weight when carrying
+    PICK_DROP_COST = 0.7  # energy units for a pick/drop (base) multiplied by weight factor
 
     def __init__(self,
                  start_cell: Tuple[int, int],
                  grid_size: int,
                  screen_size: Tuple[int, int],
+                 terrain,
                  battery_capacity: float = 100.0,
                  allow_diagonal: bool = True,
-                 allow_direct: bool = True):
+                 allow_direct: bool = True,
+                 agent_id: Optional[str] = None
+                 ):
         """
         :param start_cell: (col,row)
         :param grid_size: pixels per cell
         :param screen_size: (width, height) in pixels
+        :param terrain: shared world state used to record this drone’s physical occupancy of grid cells.
         :param battery_capacity: initial battery energy units
         :param allow_diagonal: permit diagonal neighbour steps in A*
         :param allow_direct: if True prefer direct straight-line moves to final cell center
+        :param agent_id: optional identifier string for this agent (useful for logs/planner snapshots)
+
         """
+        self.terrain = terrain
+        self.agent_id = agent_id or None
         self.col, self.row = start_cell
         self.grid_size = grid_size
         self.screen_size = screen_size
@@ -133,7 +139,7 @@ class Drone:
                                   self.row * grid_size + grid_size / 2)
 
         # world-space movement
-        self.target: Optional[pygame.Vector2] = None   # current world-space target (center of a cell)
+        self.target: Optional[pygame.Vector2] = None  # current world-space target (center of a cell)
         self.moving = False
 
         # carried parcel
@@ -160,6 +166,8 @@ class Drone:
         # behavior flags
         self.allow_diagonal = bool(allow_diagonal)
         self.allow_direct = bool(allow_direct)
+        self.last_cell = (self.col, self.row)
+        self.network_active = False
 
     # -------------------------
     # A* (energy-aware) helpers
@@ -361,66 +369,139 @@ class Drone:
             self.anim_frame = 0
 
     def arrive(self):
-        """Snap to integer cell center and advance step if using an adjacent path."""
+        """
+        Commit movement by snapping the drone to a grid cell and updating
+        authoritative world occupancy.
+
+        This method is the *only* place where physical presence is finalized:
+        planners express intent, movement interpolates in continuous space,
+        and Terrain records the committed cell on arrival.
+        """
+
+        # --------------------------------------------------
+        # Remember previous cell for terrain bookkeeping
+        # --------------------------------------------------
+        prev_cell = self.last_cell
+
+        # --------------------------------------------------
+        # Snap continuous position to integer grid cell
+        # --------------------------------------------------
         self.col = int(self.pos.x // self.grid_size)
         self.row = int(self.pos.y // self.grid_size)
-        self.pos = pygame.Vector2(self.col * self.grid_size + self.grid_size / 2,
-                                  self.row * self.grid_size + self.grid_size / 2)
+        self.last_cell = (self.col, self.row)
+
+        # Re-center world-space position exactly on the cell center
+        self.pos = pygame.Vector2(
+            self.col * self.grid_size + self.grid_size / 2,
+            self.row * self.grid_size + self.grid_size / 2,
+        )
+
+        # Movement is complete at this point
         self.target = None
         self.moving = False
 
-        # if A* adjacent path was in use then advance index
+        # --------------------------------------------------
+        # Authoritative terrain occupancy update
+        # --------------------------------------------------
+        # The drone informs the Terrain that it has physically left the
+        # previous cell and now occupies the new one. This enforces
+        # global spatial invariants (e.g., no two drones in one cell).
+        self.terrain.clear_agent_cell(self)
+        self.terrain.register_agent_cell(self, self.col, self.row)
+
+        # --------------------------------------------------
+        # A* adjacent-path progression (unchanged behavior)
+        # --------------------------------------------------
+        # If this arrival satisfies the next expected path step, advance;
+        # otherwise, clear the path defensively to avoid desynchronization.
         if self.path and self._path_step_idx < len(self.path):
             expected = self.path[self._path_step_idx]
             if (self.col, self.row) == expected:
                 self._advance_path_step()
             else:
-                # mismatch -> clear defensively
                 self.clear_path()
 
     # -------------------------
     # Pick / Drop (energy aware)
     # -------------------------
     def perform_pick(self, parcel: 'Parcel') -> bool:
-        """Pick a parcel: consumes pick energy (weight-aware). Returns True on success."""
+        """
+        Pick up a parcel from the current cell.
+
+        This operation:
+        - Consumes energy proportional to parcel weight
+        - Removes the parcel from physical world occupancy
+        - Marks the parcel as being carried by this drone
+
+        Returns True on success, False if the pick fails.
+        """
         if parcel is None:
             return False
+
         cost = self.energy_needed_for_pick_drop(parcel.weight)
         self.power.consume(cost)
+
         if self.power.is_depleted():
-            # aborted: drone lost mid-pick
             self.lost = True
             return False
-        parcel.picked = True
+
+        # Parcel is no longer physically present in the world
+        parcel.remove_from_world()
+
+        # Drone now carries the parcel
         self.carrying = parcel
         self._last_action = ("pick", (self.col, self.row), parcel)
+
         return True
 
     def perform_drop(self, parcel: 'Parcel') -> bool:
-        """Drop the parcel at current cell; consumes drop energy and may set lost if battery drained."""
+        """
+        Drop the carried parcel at the drone's current grid cell.
+
+        This operation enforces physical world constraints:
+        - A parcel cannot be dropped into an occupied cell
+        - Energy is consumed only for valid physical actions
+        - The parcel re-enters the world as a physical object
+        - Battery depletion may still cause the drone to be lost
+
+        Returns:
+            True if the drop succeeds,
+            False if the drop is blocked by physics or invalid input.
+        """
         if parcel is None:
             return False
+
+        # --------------------------------------------------
+        # PHYSICS CHECK (authoritative)
+        # --------------------------------------------------
+        # A parcel cannot be placed into an occupied cell.
+        # Occupancy includes delivered and undelivered parcels.
+        if self.terrain.occupied_cell(self.col, self.row):
+            self._last_action = ("drop_blocked", (self.col, self.row), parcel)
+            return False
+
+        # --------------------------------------------------
+        # Energy cost for dropping the parcel
+        # --------------------------------------------------
         cost = self.energy_needed_for_pick_drop(parcel.weight)
         self.power.consume(cost)
-        if self.power.is_depleted():
-            # still place parcel but drone becomes lost
-            parcel.picked = False
-            parcel.col = self.col
-            parcel.row = self.row
-            parcel.pos = pygame.Vector2(self.col * self.grid_size + self.grid_size / 2,
-                                        self.row * self.grid_size + self.grid_size / 2)
-            self.carrying = None
-            self.lost = True
-            self._last_action = ("drop", (self.col, self.row), parcel)
-            return True
 
+        # --------------------------------------------------
+        # Commit parcel back into the world
+        # --------------------------------------------------
         parcel.picked = False
-        parcel.col = self.col
-        parcel.row = self.row
-        parcel.pos = pygame.Vector2(self.col * self.grid_size + self.grid_size / 2,
-                                    self.row * self.grid_size + self.grid_size / 2)
+        parcel.place_at(self.col, self.row)
+
+        # Drone no longer carries the parcel
         self.carrying = None
         self._last_action = ("drop", (self.col, self.row), parcel)
+
+        # --------------------------------------------------
+        # Battery depletion after action
+        # --------------------------------------------------
+        if self.power.is_depleted():
+            self.lost = True
+
         return True
 
     # -------------------------
@@ -437,6 +518,25 @@ class Drone:
         if metric == "euclidean":
             return math.hypot(dx, dy)
         return float(dx + dy)
+
+    def to_snapshot(self) -> dict:
+        """
+        Return a compact planner-friendly snapshot for this drone.
+        Mirrors the fields used by AIAgentController._make_snapshot.
+        """
+        return {
+            "agent": {
+                "id": self.agent_id,
+                "col": int(self.col),
+                "row": int(self.row),
+                "battery_pct": int(self.power.percent()) if hasattr(self, "power") else 0,
+            },
+            "carrying": {
+                "has": bool(self.carrying),
+                "weight": float(self.carrying.weight) if self.carrying else 0.0,
+            },
+            "timestamp": time.time(),
+        }
 
     def energy_needed_for_cells(self, n_cells: float, weight: float = 0.0) -> float:
         """Energy to travel `n_cells` cells while carrying `weight`."""
@@ -464,7 +564,7 @@ class Drone:
         return self.power.level >= needed
 
     # -------------------------
-    # Drawing (keeps visuals similar to your earlier draw)
+    # Drawing
     # -------------------------
     def draw(self, surf, images: dict):
         """
@@ -503,7 +603,8 @@ class Drone:
             pygame.draw.circle(surf, (3, 54, 96), (x, y), int(self.grid_size * 0.35))
 
         # overlay parcel if carrying and no dedicated with-parcel image
-        if self.carrying and not images.get("drone_static_with_parcel") and not images.get("drone_rot_with_parcel_frames"):
+        if self.carrying and not images.get("drone_static_with_parcel") and not images.get(
+                "drone_rot_with_parcel_frames"):
             parcel_img = images.get("parcel_img")
             if parcel_img:
                 rect = parcel_img.get_rect(center=(x, y + int(self.grid_size * 0.18)))
@@ -574,6 +675,42 @@ class Drone:
             pygame.draw.line(surf, (200, 40, 40), (x - sz, y - sz), (x + sz, y + sz), 3)
             pygame.draw.line(surf, (200, 40, 40), (x + sz, y - sz), (x - sz, y + sz), 3)
 
+    def draw_network_pulse(self, surf, min_cells=1, max_cells=2):
+        """
+        Visual-only network pulse for the drone.
+        Single solid filled pulse that oscillates smoothly.
+        """
+        if not self.network_active:
+            return
+
+        if self.network.is_depleted():
+            return
+
+        cx, cy = int(self.pos.x), int(self.pos.y)
+
+        # Smooth oscillation
+        t = time.time()
+        phase = 0.5 + 0.5 * math.sin(t * 2.5)  # 0 → 1 → 0
+
+        inner_radius = min_cells * self.grid_size
+        outer_radius = max_cells * self.grid_size
+        radius = int(inner_radius + phase * (outer_radius - inner_radius))
+
+        # Alpha fades slightly as it expands
+        alpha = int(110 - 50 * phase)
+
+        overlay = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+
+        # Solid filled pulse
+        pygame.draw.circle(
+            overlay,
+            (120, 200, 255, alpha),  # soft cyan-blue
+            (radius, radius),
+            radius,
+        )
+
+        surf.blit(overlay, (cx - radius, cy - radius))
+
 
 class DeliveryStation:
     """Delivery station occupying a rectangular block of grid cells.
@@ -595,6 +732,50 @@ class DeliveryStation:
         self.delivered = 0  # counter for deliveries to this station
         # usage count per cell (col,row) => number of deliveries there
         self.usage = defaultdict(int)
+        self.parked_drones = {}
+
+    # ----------------------------
+    # DRONE PARKING (AUTHORITATIVE)
+    # ----------------------------
+
+    def debug_state(self):
+        return {
+            "parked": dict(self.parked_drones),
+            "usage": dict(self.usage),
+        }
+
+    def parking_cells(self):
+        return [
+            (c, r)
+            for r in range(self.row, self.row + self.h)
+            for c in range(self.col, self.col + self.w)
+        ]
+
+    def occupied_parking_cells(self):
+        return set(self.parked_drones.values())
+
+    def find_free_parking_cell(self):
+        for cell in self.parking_cells():
+            if cell not in self.occupied_parking_cells():
+                return cell
+        return None
+
+    def park_drone(self, drone):
+        # already parked
+        if drone.agent_id in self.parked_drones:
+            return self.parked_drones[drone.agent_id]
+
+        print("Parked Drones", self.parked_drones)
+
+        free = self.find_free_parking_cell()
+        if free is None:
+            return None
+
+        self.parked_drones[drone.agent_id] = free
+        return free
+
+    def unpark_drone(self, drone):
+        self.parked_drones.pop(drone.agent_id, None)
 
     def register_delivery(self, cell: Tuple[int, int]):
         """Record a delivery into a cell inside the station. Caller should ensure the cell belongs to the station."""
@@ -610,13 +791,35 @@ class DeliveryStation:
         free = [c for c in cells if not terrain.occupied_cell(c[0], c[1])]
         return free
 
-    def least_used_free_cell(self, terrain) -> Optional[Tuple[int, int]]:
-        """Return the free station cell with smallest usage (deterministic). None if no free cell."""
+    def least_used_free_cell(
+            self,
+            terrain,
+            ref_col: Optional[int] = None,
+            ref_row: Optional[int] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Return the nearest free station cell to (ref_col, ref_row).
+        If ref_col/ref_row are not provided, use the station center.
+
+        Tie break order:
+          1. Smaller Manhattan distance to reference point
+          2. Lower usage count
+          3. Row, then column for deterministic ordering
+        """
         free = self.free_cells(terrain)
         if not free:
             return None
-        # sort by usage then by coordinate to have deterministic tie-break
-        free.sort(key=lambda c: (self.usage.get((c[0], c[1]), 0), c[1], c[0]))
+
+        if ref_col is None or ref_row is None:
+            ref_col = self.col + self.w // 2
+            ref_row = self.row + self.h // 2
+
+        def sort_key(c: Tuple[int, int]) -> Tuple[int, int, int, int]:
+            dist = abs(c[0] - ref_col) + abs(c[1] - ref_row)
+            usage = self.usage.get((c[0], c[1]), 0)
+            return (dist, usage, c[1], c[0])
+
+        free.sort(key=sort_key)
         return free[0]
 
     def contains_cell(self, col: int, row: int) -> bool:
@@ -648,6 +851,9 @@ class Terrain:
         self.parcel_scale = parcel_scale
         self.parcels: List[Parcel] = []
         self.stations: List[DeliveryStation] = []
+        self.command_center = None
+        self.agent_cells = {}  # agent_id -> (col, row)
+        self.agents = {}  # agent_id -> Drone
 
     def spawn_random(self, n: int):
         cols = self.screen_size[0] // self.grid_size
@@ -657,12 +863,22 @@ class Terrain:
             r = random.randint(0, rows - 1)
             # random weight between 0.5 and 2.0
             w = random.uniform(0.5, 2.0)
-            self.add_parcel(c, r, weight=w)
+            self.add_parcel(c, r)
 
-    def add_parcel(self, col: int, row: int, weight: float = 1.0):
-        # only add if no (undelivered/unpicked) parcel at cell and not inside station
-        if self.parcel_at_cell(col, row) is None and not self.is_station_cell(col, row):
-            self.parcels.append(Parcel(col, row, self.grid_size, weight=weight))
+    def has_undelivered_parcels(self) -> bool:
+        """
+        Return True if there exists at least one parcel
+        that is not yet delivered and not currently picked.
+        """
+        for p in self.parcels:
+            if not p.delivered and not p.picked:
+                return True
+        return False
+
+    def add_parcel(self, col: int, row: int):
+        # only add if no parcel at cell at all (including delivered), and not inside station
+        if self.parcel_at_cell(col, row, include_delivered=True) is None and not self.is_station_cell(col, row):
+            self.parcels.append(Parcel(col, row, self.grid_size))
 
     def parcel_at_cell(self, col: int, row: int, include_delivered: bool = False) -> Optional[Parcel]:
         """
@@ -676,6 +892,18 @@ class Terrain:
                     continue
                 return p
         return None
+
+    def register_agent_cell(self, drone, col: int, row: int):
+        self.agent_cells[drone.agent_id] = (col, row)
+
+    def clear_agent_cell(self, drone):
+        self.agent_cells.pop(drone.agent_id, None)
+
+    def agent_at_cell(self, col: int, row: int) -> bool:
+        for _, (c, r) in self.agent_cells.items():
+            if c == col and r == row:
+                return True
+        return False
 
     def occupied_cell(self, col: int, row: int) -> bool:
         """
@@ -728,5 +956,333 @@ class Terrain:
     def draw(self, surf):
         for p in self.parcels:
             p.draw(surf, parcel_img=self.parcel_img, parcel_scale=self.parcel_scale)
+
         for s in self.stations:
             s.draw(surf)
+
+        if self.command_center:
+            self.command_center.draw(surf)
+
+
+class WorldView:
+    def snapshot(self) -> dict:
+        raise NotImplementedError
+
+
+class CommandCenter:
+    """
+    Non-mobile coordination artifact.
+
+    - Lives spatially in the world
+    - Owns a NetworkResource
+    - Has a communication range (in grid cells)
+    - Draws itself using an image and its network radius
+    """
+
+    def __init__(
+            self,
+            col: int,
+            row: int,
+            grid_size: int,
+            network_capacity: float = 100.0,
+            network_range: int = 12,
+            image_path: str = "assets/command_center.png",
+    ):
+        self.col = int(col)
+        self.row = int(row)
+        self.grid_size = int(grid_size)
+
+        self.pos = pygame.Vector2(
+            self.col * grid_size + grid_size / 2,
+            self.row * grid_size + grid_size / 2,
+        )
+
+        self.network = NetworkResource(capacity=network_capacity)
+        self.network_range = int(network_range)
+        self.terrain = None
+        self.agents = {}  # agent_id -> Drone
+
+        # Centralized brain lives here
+        from strategies.centralised import CentralisedStrategy
+        self.strategy = CentralisedStrategy()
+
+        # ----------------------------
+        # Load and scale icon
+        # ----------------------------
+        try:
+            raw = pygame.image.load(image_path).convert_alpha()
+            size = int(self.grid_size * 0.9)
+            self.image = pygame.transform.smoothscale(raw, (size, size))
+        except Exception as e:
+            print(f"[COMMAND CENTER] Failed to load image '{image_path}': {e}")
+            self.image = None
+
+    # -------------------------------------------------
+    # Connectivity
+    # -------------------------------------------------
+    def can_communicate(self, drone) -> bool:
+        if self.network.is_depleted() or drone.network.is_depleted():
+            return False
+
+        d = abs(self.col - drone.col) + abs(self.row - drone.row)
+        return d <= self.network_range
+
+    def consume_network(self, drone):
+        d = abs(self.col - drone.col) + abs(self.row - drone.row)
+        cost = float(d)
+        self.network.consume(cost)
+        drone.network.consume(cost)
+
+    # -------------------------------------------------
+    # Network pulse (VISIBLE)
+    # -------------------------------------------------
+    def _draw_network_pulse(self, surf):
+        cx, cy = int(self.pos.x), int(self.pos.y)
+
+        # ---- Pulse bounds in GRID CELLS ----
+        inner_cells = 2
+        outer_cells = max(inner_cells + 1, self.network_range)
+
+        inner_radius = inner_cells * self.grid_size
+        outer_radius = outer_cells * self.grid_size
+
+        # ---- Time-based smooth oscillation ----
+        t = time.time()
+        phase = 0.5 + 0.5 * math.sin(t * 2.0)  # 0 → 1 → 0
+
+        radius = int(inner_radius + phase * (outer_radius - inner_radius))
+
+        # Alpha fades as wave expands
+        alpha = int(140 - 80 * phase)
+
+        overlay = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+
+        # Soft expanding wave
+        pygame.draw.circle(
+            overlay,
+            (120, 170, 255, alpha),
+            (radius, radius),
+            radius,
+        )
+
+        # Wavefront ring
+        pygame.draw.circle(
+            overlay,
+            (160, 210, 255, min(200, alpha + 40)),
+            (radius, radius),
+            radius,
+            width=2,
+        )
+
+        surf.blit(overlay, (cx - radius, cy - radius))
+
+    # -------------------------------------------------
+    # Drawing
+    # -------------------------------------------------
+    def draw(self, surf):
+        cx, cy = int(self.pos.x), int(self.pos.y)
+
+        # --- Network pulse FIRST (so icon sits on top)
+        if not self.network.is_depleted():
+            self._draw_network_pulse(surf)
+
+        # --- Command center icon
+        if self.image:
+            rect = self.image.get_rect(center=(cx, cy))
+            surf.blit(self.image, rect)
+        else:
+            r = int(self.grid_size * 0.4)
+            pygame.draw.circle(surf, (90, 160, 255), (cx, cy), r, 3)
+
+    def bind_terrain(self, terrain):
+        self.terrain = terrain
+
+    def snapshot(self) -> dict:
+        """
+        Build an authoritative global snapshot of the world.
+
+        This snapshot is the ONLY information source available
+        to centralized strategies.
+        """
+        terrain = self.terrain
+
+        return {
+            "agents": [
+                {
+                    "id": a.agent_id,
+                    "col": a.col,
+                    "row": a.row,
+                    "battery_pct": a.power.percent(),
+                }
+                for a in terrain.agents.values()
+            ],
+            "parcels": [
+                {
+                    "id": p.id,
+                    "col": p.col,
+                    "row": p.row,
+                    "weight": getattr(p, "weight", 1.0),
+                    "picked": p.picked,
+                    "delivered": p.delivered,
+                }
+                for p in terrain.parcels
+            ],
+            "stations": [
+                {
+                    "col": s.col,
+                    "row": s.row,
+                    "w": s.w,
+                    "h": s.h,
+                }
+                for s in terrain.stations
+            ],
+        }
+
+    def update(self, agents, parcels, now=None):
+        """
+        Advance centralized coordination for the current world state.
+
+        This is the ONLY place where CentralisedStrategy.step() is called.
+        """
+        if self.terrain is None:
+            return
+
+        self.strategy.step(
+            terrain=self.terrain,
+            agents=agents,
+            parcels=parcels,
+            now=now,
+        )
+
+    def _get_agent(self, agent_id: str):
+        """
+        Resolve an agent_id to a registered Drone instance.
+        """
+        return self.agents.get(agent_id)
+
+    def request_directive(self, agent_id: str) -> dict:
+        """
+        Handle a directive request from a drone agent.
+
+        This method represents the *only* legitimate interaction point between
+        a drone-side controller (AIAgentController) and the centralized
+        CommandCenter.
+
+        Conceptual contract:
+        --------------------
+        - The drone does NOT run the centralized strategy.
+        - The drone asks the CommandCenter for guidance.
+        - The CommandCenter decides whether it can respond, based on:
+            1) Agent existence
+            2) Network connectivity and remaining capacity
+        - If communication is possible, the CommandCenter:
+            a) Builds a global snapshot from the terrain
+            b) Delegates reasoning to CentralisedStrategy
+            c) Accounts for network cost AFTER the decision
+        - If communication is not possible, the drone is instructed to wait.
+
+        This preserves:
+        - Physical realism (range + bandwidth constraints)
+        - Clear authority boundaries
+        - Deterministic reasoning order (sense → decide → pay cost)
+
+        Parameters
+        ----------
+        agent_id : str
+            Unique identifier of the requesting drone agent.
+
+        Returns
+        -------
+        dict
+            A directive dictionary with at least a "mode" key.
+            Expected modes include:
+                - "plan" : contains a full execution plan
+                - "task" : assigns a specific parcel or task
+                - "wait" : agent should remain idle but alive
+                - "idle" : agent has no further role in the mission
+        """
+
+        # --------------------------------------------------
+        # 1. Resolve agent from registry
+        # --------------------------------------------------
+        agent = self._get_agent(agent_id)
+
+        if agent is None:
+            print(
+                f"[CC][REQUEST] agent_id={agent_id} "
+                f"status=UNKNOWN_AGENT → WAIT"
+            )
+            return {"mode": "wait"}
+
+        # --------------------------------------------------
+        # 2. Check communication feasibility
+        # --------------------------------------------------
+        can_comm = self.can_communicate(agent)
+
+        print(
+            f"[CC][REQUEST] agent_id={agent_id} "
+            f"resolved=True "
+            f"can_communicate={can_comm} "
+            f"cc_net={self.network.level:.2f} "
+            f"agent_net={agent.network.level:.2f}"
+        )
+
+        if not can_comm:
+            # Agent exists but cannot currently communicate
+            return {"mode": "wait"}
+
+        # --------------------------------------------------
+        # 3. Build authoritative global snapshot
+        # --------------------------------------------------
+        snapshot = self.snapshot()
+
+        print(
+            f"[CC][SNAPSHOT] agent_id={agent_id} "
+            f"agents={len(snapshot.get('agents', []))} "
+            f"parcels={len(snapshot.get('parcels', []))}"
+        )
+
+        # --------------------------------------------------
+        # 4. Delegate reasoning to centralized strategy
+        # --------------------------------------------------
+        decision = self.strategy.decide(snapshot, agent_id)
+
+        print(
+            f"[CC][DECISION] agent_id={agent_id} "
+            f"mode={decision.get('mode')}"
+        )
+
+        # --------------------------------------------------
+        # 5. Account for network cost (post-decision)
+        # --------------------------------------------------
+
+        if decision.get("mode") != "wait":
+            # Mark ACTIVE network usage
+            agent.network_active = True
+            self.consume_network(agent)
+
+        print(
+            f"[CC][DECISION] agent_id={agent_id} "
+            f"mode={decision.get('mode')}"
+        )
+
+        print(
+            f"[CC][NETWORK] agent_id={agent_id} "
+            f"cc_net_after={self.network.level:.2f} "
+            f"agent_net_after={agent.network.level:.2f}"
+        )
+
+        return decision
+
+    def register_agent(self, drone):
+        """
+        Register a drone with the Command Center.
+
+        This establishes the drone as a participant in centralized coordination.
+        """
+        self.agents[drone.agent_id] = drone
+        print(f"[CC][REGISTER] agent_id={drone.agent_id}")
+
+    def unregister_agent(self, drone):
+        self.agents.pop(drone.agent_id, None)
+        print(f"[CC][UNREGISTER] agent_id={drone.agent_id}")

@@ -1,6 +1,13 @@
 # Agentic AI Meets Multi-Robot Swarms  
 ### Episodic LLM Guidance for Decentralised Autonomy under Resource Constraints
 
+
+
+## TL;DR
+
+This repository contains an applied research simulation framework for studying how Small Language Models (SLMs) and episodic Large Language Models (LLMs) can be used as coordination, negotiation, and arbitration primitives in decentralised multi-robot systems operating under intermittent connectivity, limited bandwidth, and finite energy.
+
+The goal is to empirically evaluate whether language-mediated orchestration improves coordination stability, convergence, and energy efficiency compared to classical decentralised and centralised baselines.
 ## Overview
 This repository provides a **PyGame-based simulation environment** designed to explore the intersection of **Agentic AI** and **multi-robot swarm coordination** under realistic resource limitations.  
 Each drone (agent) operates within a grid world, tasked with locating, picking up, and delivering parcels — all while managing internal resources such as **power** and **network connectivity**.
@@ -46,22 +53,41 @@ Two controllers are provided:
   
 A **ControllerSwitcher** allows toggling between human and AI control at runtime (`TAB` key).
 
-### Hybrid Architecture (Planned)
-Two configurations are compared:
+### Hybrid Coordination Architecture
 
-#### 1. Baseline Swarm
-- Agents follow fixed heuristics (simple pickup/delivery rules).  
-- Communication and energy management are purely local.
+Three coordination strategies are compared to study how different levels of structure and authority affect decentralised multi-agent performance under energy and communication constraints.
 
-#### 2. Predictive Hybrid Swarm
-- Agents integrate **Small Language Models (SLMs)** for local prediction of peer state.  
-- When energy or prediction confidence drops below a threshold, agents query a **central LLM (Episodic Guidance Module)** for high-level strategic updates.  
-- The LLM provides **coordination cues** such as resource redistribution, movement prioritisation, and energy-saving strategies.
+#### 1. Centralized Coordination
+- A central coordinator assigns tasks based on a global view of agent state and task availability when communication permits.
+- Agents execute assigned tasks autonomously but do not negotiate or reassign tasks among themselves.
+- When communication with the central coordinator is unavailable, no new assignments are issued and coordination degrades.
+- This strategy represents a classical centralized planning approach with partial connectivity.
+
+#### 2. Decentralized Greedy Coordination
+- Agents operate fully autonomously using local, greedy pickup and delivery heuristics.
+- Task selection, movement, and energy management are handled purely locally.
+- Agents do not model peer intent, anticipate conflicts, or exchange structured coordination signals.
+- Communication, when available, does not influence planning decisions.
+- This strategy serves as a decentralised lower bound, highlighting inefficiencies caused by uncoordinated autonomy.
+
+#### 3. Structured Predictive Purpose-Driven Emergent Coordination (SPPDEC)
+- Agents implement **Structured Predictive Purpose-Driven Emergent Coordination (SPPDEC)** as the proposed method.
+- Each agent performs predictive local reasoning to evaluate task feasibility, energy safety, and potential conflicts.
+- Coordination emerges dynamically through:
+  - explicit purpose formation,
+  - structured intent exchange when communication is available,
+  - contextual emergence and transfer of purpose-scoped coordination authority,
+  - conservative refusal of unsafe or inefficient commitments.
+- A **Large Language Model (LLM)** is used episodically as a guidance and arbitration mechanism when local coordination fails, prediction confidence degrades, or persistent conflicts arise.
+- The LLM provides high-level coordination cues such as task redistribution, movement prioritisation, conflict resolution, and energy-balancing strategies.
+- The LLM does not issue continuous control commands, does not override local safety constraints, and is not required for ongoing execution.
+- When communication or LLM access is unavailable, agents continue operating autonomously using predictive local reasoning, allowing coordination quality to degrade gracefully without loss of safety.
 
 ---
 
 ## Resource Dynamics
 Each agent manages:
+
 | Resource | Description | Effect |
 |-----------|--------------|--------|
 | **Power** | Depletes with travel distance and carried load | Determines operation time before recharge |
@@ -105,12 +131,21 @@ This project aims to:
 
 src/
 │
-├── game.py                # Main simulation loop (PyGame)
-├── artifacts.py           # Terrain, Drone, Parcel, Station definitions
-├── controllers.py         # Human and AI controller logic
-├── utils.py               # Helper utilities (image scaling, loading)
-└── graphics/              # Drone and parcel sprites
-
+├─ graphics/                # Drone, parcel, station sprites
+├─ strategies/              # Decision-making layer (NEW, core to paper)
+│   ├─ __init__.py
+│   ├─ base.py              # BaseStrategy (abstract protocol interface)
+│   ├─ centralised.py       # Centralised planner strategy
+│   ├─ decentralised_greedy.py  # Local greedy decentralised strategy
+│   ├─ naive.py             # NaiveStrategy (current behaviour refactored)
+│   └─ structured_decentralised_protocol.py  # Implements SPPDEC (Structured Predictive Purpose-Driven Emergent Coordination)
+├─ artifacts.py            # Terrain, Drone, Parcel, Station definitions
+├─ controllers.py          # HumanAgentController, AIAgentController
+├─ flight_recorder.py       # Metrics, traces, trajectories, outcomes
+├─ game.py                 # Main PyGame simulation loop
+├─ run_experiment.py        # Experiment runner, batch execution, logging
+├─ utils.py                # Helper utilities (image scaling, loading, etc.)
+│
 ````
 
 ---
