@@ -167,7 +167,7 @@ src/
 ```bash
 git clone https://github.com/opemipoVRB/MultiAgentSimulator
 cd MultiAgentSimulator/src
-pip install pygame-ce
+pip install requirements.txt
 python game.py
 ````
 
