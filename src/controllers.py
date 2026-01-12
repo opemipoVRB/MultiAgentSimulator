@@ -1,24 +1,13 @@
 # src/controllers.py
-import os
-import pygame
 import random
 import time
 from typing import Optional, Tuple, List, Dict
 
-from strategies.naive import NaiveStrategy
-
-# ---------------------------------------------------------------------------
-# Strategy configuration (Naive decentralised baseline)
-# ---------------------------------------------------------------------------
-
-NAIVE_NUM_TRIALS = 10  # Monte Carlo greedy rollouts per agent
-
-STRATEGY = NaiveStrategy(
-    num_trials=NAIVE_NUM_TRIALS,
-)
+import pygame
 
 # If True, AI will attempt trips even if it cannot guarantee a return-to-base.
 # The drone will be allowed to attempt pickup/drop and may become lost if battery drains mid-route.
+
 ALLOW_RISKY_TRIPS = True
 
 
@@ -30,10 +19,51 @@ class BaseAgentController:
         self.terrain = terrain
 
     def handle_event(self, event):
+        """Handle pygame events. Override in subclasses."""
         pass
 
     def update(self, dt: float, step: int, sim_time: float):
+        """Update controller state. Override in subclasses."""
         pass
+
+    # ADD THESE METHODS:
+    def needs_decision(self) -> bool:
+        """
+        Return True if the controller is ready to compute a new decision.
+
+        For AI controllers: returns True when idle and ready for a new plan.
+        For human controllers: always returns False (human decisions are event-driven).
+
+        Default implementation returns False.
+        """
+        return False
+
+    def compute_decision(self):
+        """
+        Compute and return a decision for the agent.
+
+        For AI controllers: returns a decision dict from the strategy.
+        For human controllers: should not be called - raises NotImplementedError.
+
+        Returns:
+            Dict: The decision object
+        Raises:
+            NotImplementedError: If called on a controller that doesn't implement it
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement compute_decision()"
+        )
+
+    def apply_decision(self, decision):
+        """
+        Apply a previously computed decision to the controller.
+
+        For AI controllers: commits the decision into controller state.
+        For human controllers: typically a no-op.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement apply_decision()"
+        )
 
 
 class HumanAgentController(BaseAgentController):
@@ -94,11 +124,11 @@ class HumanAgentController(BaseAgentController):
                     success = self.drone.perform_pick(p)
                     if not success:
                         # pick failed due to battery -> pick_failed UI flash
-                        self.drone._last_action = ("pick_failed", (self.drone.col, self.drone.row), None)
+                        self.drone.last_action = ("pick_failed", (self.drone.col, self.drone.row), None)
             else:
                 # drop only if target cell has no non-picked parcel (includes delivered)
                 if self.terrain.occupied_cell(self.drone.col, self.drone.row):
-                    self.drone._last_action = ("drop_failed", (self.drone.col, self.drone.row), None)
+                    self.drone.last_action = ("drop_failed", (self.drone.col, self.drone.row), None)
                 else:
                     self.drone.perform_drop(self.drone.carrying)
 
@@ -146,40 +176,143 @@ class AIAgentController(BaseAgentController):
             f"strategy={type(strategy).__name__}"
         )
 
+    def needs_decision(self):
+        return (
+                not self.plan
+                and not self.no_feasible_plan
+                and not self.drone.moving
+        )
+
+    def compute_decision(self):
+        if self.terrain.command_center:
+            return self.terrain.command_center.request_directive(self.drone.agent_id)
+        return self.strategy.decide(self._make_snapshot())
+
+    def apply_decision(self, decision):
+        mode = decision.get("mode")
+
+        if mode == "plan":
+            self._load_plan(decision["plan"])
+        elif mode == "wait":
+            return
+        elif mode == "idle":
+            self.no_feasible_plan = True
+        else:
+            raise RuntimeError(f"Unknown strategy mode: {mode}")
+
     # ---------------------------
     # Planner interaction
     # ---------------------------
     def _make_snapshot(self) -> Dict:
-        """Create a compact snapshot of the world state for the planner input."""
+        """
+        Create a compact, perception-only snapshot of the world state.
+
+        This snapshot represents the agent's *local world view* at the current
+        decision step. It contains only observable state and internal proprioception.
+        It does NOT contain predictions, intentions, plans, or coordination signals.
+
+        The snapshot is the sole input to all decentralized strategies
+        (Naive, SPPDEC Phase 1).
+        """
         snap = {
+            # -------------------------------------------------
+            # Self perception (proprioception)
+            # -------------------------------------------------
             "agent": {
                 "id": self.drone.agent_id,
                 "col": int(self.drone.col),
                 "row": int(self.drone.row),
-                "battery_pct": int(self.drone.power.percent()) if hasattr(self.drone, "power") else 0,
+                "battery_pct": (
+                    int(self.drone.power.percent())
+                    if hasattr(self.drone, "power")
+                    else 0
+                ),
             },
+
+            # -------------------------------------------------
+            # Internal carried state (locally observable)
+            # -------------------------------------------------
             "carrying": {
                 "has": bool(self.drone.carrying),
-                "weight": getattr(self.drone.carrying, "weight", 0.0) if self.drone.carrying else 0.0,
+                "weight": (
+                    getattr(self.drone.carrying, "weight", 0.0)
+                    if self.drone.carrying
+                    else 0.0
+                ),
             },
+
+            # -------------------------------------------------
+            # Environmental structure
+            # -------------------------------------------------
             "nearest_station": None,
+
+            # -------------------------------------------------
+            # Task perception
+            # -------------------------------------------------
             "all_parcels": [],
+
+            # -------------------------------------------------
+            # Social perception (peer existence only)
+            # -------------------------------------------------
+            "other_agents": [],
+
+            # -------------------------------------------------
+            # Temporal grounding
+            # -------------------------------------------------
             "timestamp": time.time(),
         }
+
+        # -------------------------------------------------
+        # Nearest station (observable infrastructure)
+        # -------------------------------------------------
         station = self.terrain.nearest_station(self.drone.col, self.drone.row)
         if station:
-            snap["nearest_station"] = {"col": station.col, "row": station.row, "w": station.w, "h": station.h}
+            snap["nearest_station"] = {
+                "col": int(station.col),
+                "row": int(station.row),
+                "w": int(station.w),
+                "h": int(station.h),
+            }
 
+        # -------------------------------------------------
+        # Parcels (observable task objects)
+        # -------------------------------------------------
         for p in self.terrain.parcels:
             snap["all_parcels"].append(
                 {
-                    "col": p.col,
-                    "row": p.row,
+                    "id": getattr(p, "id", None),
+                    "col": int(p.col),
+                    "row": int(p.row),
                     "weight": getattr(p, "weight", 1.0),
-                    "picked": getattr(p, "picked", False),
-                    "delivered": getattr(p, "delivered", False),
+                    "picked": bool(getattr(p, "picked", False)),
+                    "delivered": bool(getattr(p, "delivered", False)),
                 }
             )
+
+        # -------------------------------------------------
+        # Other agents (position + basic capability only)
+        # -------------------------------------------------
+        for agent in self.terrain.agents.values():
+            if agent is self.drone:
+                continue
+
+            snap["other_agents"].append(
+                {
+                    "id": agent.agent_id,
+                    "col": int(agent.col),
+                    "row": int(agent.row),
+                    "battery_pct": (
+                        int(agent.power.percent())
+                        if hasattr(agent, "power")
+                        else None
+                    ),
+                    # IMPORTANT:
+                    # Do NOT include plans, targets, or intentions.
+                    # Carrying state MAY be observable visually.
+                    "carrying": bool(getattr(agent, "carrying", None)),
+                }
+            )
+
         return snap
 
     def _trim_narration(self, text: str) -> Optional[str]:
@@ -340,7 +473,7 @@ class AIAgentController(BaseAgentController):
                     "h": int(station_obj.h),
                 }
 
-            next_choice = STRATEGY.choose_best_feasible_next_parcel(
+            next_choice = self.strategy.choose_best_feasible_next_parcel(
                 progress=progress,
                 parcels=[
                     {
@@ -373,7 +506,7 @@ class AIAgentController(BaseAgentController):
                 if evidence is not None:
                     prior = self.plan_confidence
 
-                    modifier = STRATEGY.compute_posterior_confidence_modifier(
+                    modifier = self.strategy.compute_posterior_confidence_modifier(
                         prior_confidence=prior,
                         evidence=evidence,
                     )
@@ -664,7 +797,7 @@ class AIAgentController(BaseAgentController):
                 if p_here:
                     success = self.drone.perform_pick(p_here)
                     if not success:
-                        self.drone._last_action = (
+                        self.drone.last_action = (
                             "pick_failed",
                             (self.drone.col, self.drone.row),
                             None,
@@ -804,3 +937,17 @@ class ControllerSwitcher:
 
     def update(self, dt: float, step: int, sim_time: float):
         self.current.update(dt, step, sim_time)
+
+    # ADD THESE METHODS:
+    def needs_decision(self):
+        """Delegate to current controller."""
+        return self.current.needs_decision()
+
+    def compute_decision(self):
+        """Delegate to current controller."""
+        return self.current.compute_decision()
+
+    def apply_decision(self, decision):
+        """Delegate to current controller."""
+        return self.current.apply_decision(decision)
+

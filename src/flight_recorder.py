@@ -1,3 +1,4 @@
+# src/flight_recorder.py
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 import time
@@ -62,14 +63,15 @@ class FlightRecorder:
     # Initialization
     # ======================================================
     def __init__(
-        self,
-        run_id: str,
-        planner: str,
-        agents: List[Dict],
-        parcels: List[Dict[str, any]],
-        grid_size: int,
-        dt: float = 1.0,
-        sim_dt: Optional[float] = None,
+            self,
+            run_id: str,
+            planner: str,
+            strategy_name,
+            agents: List[Dict],
+            parcels: List[Dict[str, any]],
+            grid_size: int,
+            dt: float = 1.0,
+            sim_dt: Optional[float] = None,
     ):
         """
                 Initialize a FlightRecorder instance for a single experiment run.
@@ -109,6 +111,7 @@ class FlightRecorder:
         self.grid_size = grid_size
         self.dt = sim_dt if sim_dt is not None else dt
         self.started_at = time.time()
+        self.strategy_name = strategy_name
 
         # ==================================================
         # Agent registry
@@ -253,6 +256,7 @@ class FlightRecorder:
                 # Parcel was picked but not delivered at snapshot time
                 # This is a tricky case - the parcel should be with an agent
                 print(f"[FLIGHT-RECORDER] WARNING: Parcel {parcel_id} is picked but not delivered in snapshot")
+
     # ======================================================
     # Register Parcel
     # ======================================================
@@ -504,13 +508,29 @@ class FlightRecorder:
             if data["energy"]:
                 data["final_battery"] = data["energy"][-1]["battery_pct"]
 
+                start = data["energy"][0]["battery"]
+                end = data["energy"][-1]["battery"]
+                data["energy_consumed"] = max(0.0, start - end)
+            else:
+                data["energy_consumed"] = 0.0
+
+    def _json_safe(self, obj):
+        if isinstance(obj, dict):
+            return {k: self._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._json_safe(v) for v in obj]
+        if isinstance(obj, set):
+            return list(obj)
+        return obj
+
     def export(self) -> Dict:
         self.finalize()
 
-        return {
+        raw = {
             "meta": {
                 "run_id": self.run_id,
                 "planner": self.planner,
+                "strategy": self.strategy_name,
                 "started_at": self.started_at,
             },
             "agents": list(self.agents.values()),
@@ -518,6 +538,8 @@ class FlightRecorder:
             "fleet_events": self.fleet_events,
             "heatmap": self.export_heatmap(),
         }
+
+        return self._json_safe(raw)
 
     def export_heatmap(self) -> Dict:
         return {

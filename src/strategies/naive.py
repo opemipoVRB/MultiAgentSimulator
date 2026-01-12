@@ -1,3 +1,4 @@
+# src/strategies/naive.py
 """
 Naive decentralised single-agent planning strategy with operational robustness.
 
@@ -19,7 +20,6 @@ import random
 from collections import defaultdict
 from typing import Dict, Any, List, Tuple, Optional
 from .base import BaseStrategy
-from .utils import manhattan, est_cost_cells
 
 
 class NaiveStrategy(BaseStrategy):
@@ -55,7 +55,7 @@ class NaiveStrategy(BaseStrategy):
     enable_reactive_fallback = True
     requires_plan_completion_before_requery = False
 
-    def __init__(self, num_trials: int = 10):
+    def __init__(self, physics, num_trials: int = 10):
         """
         Initialize the naive strategy with operational robustness.
 
@@ -66,6 +66,7 @@ class NaiveStrategy(BaseStrategy):
             Higher values increase exploration of task-battery trade-offs.
         """
         self.num_trials = num_trials
+        self.physics = physics
 
     # ------------------------------------------------------------------
     # Public API
@@ -513,8 +514,7 @@ class NaiveStrategy(BaseStrategy):
             "strategy": "naive-multi-greedy",
         }
 
-    @staticmethod
-    def _any_parcel_feasible(snapshot: Dict[str, Any], parcels: List[Dict[str, Any]]) -> bool:
+    def _any_parcel_feasible(self, snapshot: Dict[str, Any], parcels: List[Dict[str, Any]]) -> bool:
         """
         Quick check if ANY parcel can be delivered with current battery.
 
@@ -555,12 +555,12 @@ class NaiveStrategy(BaseStrategy):
             drop_pos = quick_drop(pick_pos)
 
             # Conservative energy estimate
-            pickup_dist = manhattan(cur_pos, pick_pos)
-            delivery_dist = manhattan(pick_pos, drop_pos)
+            pickup_dist = self.physics.distance(a=cur_pos, b=pick_pos)
+            delivery_dist = self.physics.distance(a=pick_pos, b=drop_pos)
             weight = float(p.get("weight", NOMINAL_WEIGHT))
 
-            pickup_cost = est_cost_cells(pickup_dist, 0.0)
-            delivery_cost = est_cost_cells(delivery_dist, weight)
+            pickup_cost = self.physics.energy_cost(distance=pickup_dist, weight=0.0)
+            delivery_cost = self.physics.energy_cost(distance=delivery_dist, weight=weight)
             total_cost = pickup_cost + delivery_cost
 
             if current_battery >= total_cost + SAFETY_MARGIN:
@@ -721,11 +721,11 @@ class NaiveStrategy(BaseStrategy):
                 est_weight = true_weight if known_weight else NOMINAL_WEIGHT
 
                 # Calculate energy costs
-                pickup_dist = manhattan(cur_pos, pick_pos)
-                delivery_dist = manhattan(pick_pos, drop_pos)
+                pickup_dist = self.physics.distance(a=cur_pos, b=pick_pos)
+                delivery_dist = self.physics.distance(a=pick_pos, b=drop_pos)
 
-                pickup_cost = est_cost_cells(pickup_dist, 0.0)
-                delivery_cost = est_cost_cells(delivery_dist, est_weight)
+                pickup_cost = self.physics.energy_cost(distance=pickup_dist, weight=0.0)
+                delivery_cost = self.physics.energy_cost(distance=delivery_dist, weight=est_weight)
                 total_cost = pickup_cost + delivery_cost
 
                 # Feasibility check
@@ -790,7 +790,7 @@ class NaiveStrategy(BaseStrategy):
         ]
 
         # Compute distance-based weights
-        distances = [manhattan(pick, cell) for cell in cells]
+        distances = [self.physics.distance(a=pick, b=cell) for cell in cells]
         weights = [1.0 / (d + 1.0) for d in distances]
 
         return random.choices(cells, weights=weights, k=1)[0]
@@ -837,10 +837,8 @@ class NaiveStrategy(BaseStrategy):
             est_weight = true_weight if known_weight else NOMINAL_WEIGHT
 
             # Estimated energy cost
-            est_cost = (
-                    est_cost_cells(manhattan(current_cell, pick), 0.0)
-                    + est_cost_cells(manhattan(pick, drop), est_weight)
-            )
+            est_cost = (self.physics.energy_cost(distance=self.physics.distance(a=current_cell, b=pick), weight=0.0)
+                        + self.physics.energy_cost(distance=self.physics.distance(a=pick, b=drop), weight=est_weight))
 
             # Feasibility check
             if battery < est_cost + safety_margin:
@@ -869,7 +867,7 @@ class NaiveStrategy(BaseStrategy):
         # Select nearest feasible parcel, then lowest cost
         candidates.sort(
             key=lambda c: (
-                manhattan(current_cell, c["pickup"]),
+                self.physics.distance(a=current_cell, b=c["pickup"]),
                 c["estimated_cost"],
             )
         )
@@ -885,8 +883,8 @@ class NaiveStrategy(BaseStrategy):
             "posterior_evidence": chosen["evidence"],
         }
 
-    @staticmethod
     def _compute_reactive_evidence(
+            self,
             *,
             battery_before: float,
             estimated_cost: float,
@@ -899,7 +897,7 @@ class NaiveStrategy(BaseStrategy):
         This method makes no judgement. It only reports facts.
         """
         expected_remaining = battery_before - estimated_cost
-        travel_distance = manhattan(current_cell, pickup_cell)
+        travel_distance = self.physics.distance(a=current_cell, b=pickup_cell)
 
         return {
             "battery_before": round(battery_before, 3),
@@ -940,5 +938,3 @@ class NaiveStrategy(BaseStrategy):
         )
 
         return modifier
-
-

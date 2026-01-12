@@ -163,27 +163,86 @@ src/
 
 ---
 
-## Installation
+> ## Experimental Hardware
+>
+> All experiments were conducted on a local workstation with the following specifications:
+>
+> * CPU: 24 physical cores (32 logical)
+> * RAM: 62 GB
+> * OS: Linux (Ubuntu)
+> * Python: 3.9
+>
+>Agent limits in the simulator are dynamically constrained by a built-in system capacity checker to ensure realistic embodied deployment assumptions, based on available system resources. For example, on this machine, the practical limit for SPPDEC experiments using onboard SLM inference was 24 agents.
+
+
+---
+
+## Installation and Setup
+
+### Requirements
+- Python 3.9+
+- Git
+- Ollama installed locally (https://ollama.com)
+
+### Setup
+
 ```bash
 git clone https://github.com/opemipoVRB/MultiAgentSimulator
-cd MultiAgentSimulator/src
-pip install requirements.txt
+cd MultiAgentSimulator
+pip install -r requirements.txt
+```
+
+Install Ollama and verify it works:
+```bash
+ollama --version
+```
+
+Pull the required model:
+```bash
+ollama pull phi3:mini
+```
+
+Confirm the model is available:
+```bash
+ollama list
+```
+
+You should see `phi3:mini` in the output.
+
+Create a `.env` file in the project root with the following content:
+```env
+LLM_BACKEND=ollama
+OLLAMA_MODE=embedded
+OLLAMA_MODEL=phi3:mini
+OLLAMA_MODELS_DIR=~/.ollama/models
+```
+
+The simulator resolves the model path correctly at runtime.
+
+### Run the simulator
+
+```bash
+cd src
 python game.py
-````
+```
+
+### Troubleshooting
+
+If agents fail with `model not found`, verify Ollama can see the model:
+```bash
+ollama list
+```
+
+If `phi3:mini` does not appear, re-run:
+```bash
+ollama pull phi3:mini
+```
 
 ---
 
-## Next Steps
-
-* Integrate **energy and bandwidth simulation** into the agent model.
-* Connect the **Episodic Guidance Module** via LangChain/LangGraph.
-* Extend to multi-agent scenarios for cooperative decision-making.
-* Evaluate resource-aware task allocation strategies.
-
----
 
 ## Citation
-> **Opemipo Durodola (2025)**
+> **Opemipo Durodola (2026)**
 > *Agentic AI Meets Multi-Robot Swarms: Episodic LLM Guidance for Decentralised Autonomy under Resource Constraints*
 > Simulation and prototype research framework, 2025.
 ---

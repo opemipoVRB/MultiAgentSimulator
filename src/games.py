@@ -277,15 +277,15 @@ def run_game(initial_parcels):
         switcher.update(dt)
 
         # after controllers run, check if drone reported an action for flash feedback
-        if hasattr(drone, "_last_action") and drone._last_action:
-            kind = drone._last_action[0]
+        if hasattr(drone, "last_action") and drone.last_action:
+            kind = drone.last_action[0]
             if kind == "pick":
-                _, cell, parcel = drone._last_action
+                _, cell, parcel = drone.last_action
                 flash_color = (60, 220, 100, 160)
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
             elif kind == "drop":
-                _, cell, parcel = drone._last_action
+                _, cell, parcel = drone.last_action
                 flash_color = (240, 120, 120, 160)
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
@@ -306,19 +306,19 @@ def run_game(initial_parcels):
                         session_delivered += 1
 
             elif kind == "pick_failed":
-                _, cell, _ = drone._last_action
+                _, cell, _ = drone.last_action
                 flash_color = (240, 200, 80, 160)  # yellow-ish
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
 
             elif kind == "drop_failed":
-                _, cell, _ = drone._last_action
+                _, cell, _ = drone.last_action
                 flash_color = (240, 200, 80, 160)  # yellow-ish
                 flash_cell = cell
                 flash_timer = FLASH_DURATION
 
             # clear the action so we do not process it again
-            drone._last_action = None
+            drone.last_action = None
 
         # update session timer
         if session_active:
