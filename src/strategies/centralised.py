@@ -1,11 +1,12 @@
+# src/strategies/centralised.py
 from typing import Dict, List, Optional, Tuple
 import time
-
 from artifacts import Drone, Parcel, Terrain
-from strategies.utils import manhattan, est_cost_cells
+
+from strategies.base import BaseStrategy
 
 
-class CentralisedStrategy:
+class CentralisedStrategy(BaseStrategy):
     """
     Centralised task allocation strategy.
 
@@ -40,10 +41,11 @@ class CentralisedStrategy:
     enable_reactive_fallback = False
     requires_plan_completion_before_requery = True
 
-    def __init__(self, stall_seconds: float = 6.0):
+    def __init__(self, physics, stall_seconds: float = 6.0):
         self.stall_seconds = stall_seconds
         # agent_id -> assignment record
         self.assignments: Dict[str, Dict] = {}
+        self.physics = physics
 
     # ---------------------------------------------------------
     # Public API
@@ -51,32 +53,45 @@ class CentralisedStrategy:
 
     def decide(self, snapshot: Dict, agent_id: str) -> Dict:
         """
-        Decide an executable directive for a specific agent based on a
-        global snapshot of the world.
+        Produce a controller-compatible directive for a single agent
+        using centralized task allocation.
 
-        This method adheres strictly to the planner → controller contract:
-        - It NEVER returns raw execution steps.
-        - It ALWAYS wraps plans inside a plan envelope.
-        - The controller remains the sole executor.
+        Architectural contract
+        ----------------------
+        This method:
+        - Assigns at most ONE parcel per agent at a time
+        - Treats execution as opaque (does NOT inspect carrying state)
+        - Does NOT declare mission completion
+        - Does NOT perform replanning while an assignment is valid
+        - Relies on the experiment runner for global termination
+
+        Valid return modes
+        ------------------
+        - {"mode": "plan", ...} : issue a single-step pickup → dropoff plan
+        - {"mode": "wait"}      : no task available or assignment in progress
+        - {"mode": "idle"}      : station missing or unrecoverable setup error
 
         Parameters
         ----------
         snapshot : Dict
-            Global snapshot built by CommandCenter.
-            Expected keys: agents, parcels, stations.
+            Global world snapshot constructed by the CommandCenter.
+            Expected keys:
+                - agents
+                - parcels
+                - stations
+
         agent_id : str
-            ID of the requesting agent.
+            Identifier of the requesting agent.
 
         Returns
         -------
         Dict
-            Directive dictionary with a `mode` key.
-            Supported modes: plan, wait, idle
+            Controller-compatible directive.
         """
 
-        # --------------------------------------------------
-        # 1. Resolve agent
-        # --------------------------------------------------
+        # ==================================================
+        # 1. Resolve agent from snapshot
+        # ==================================================
         agents = snapshot.get("agents", [])
         parcels = snapshot.get("parcels", [])
         stations = snapshot.get("stations", [])
@@ -90,57 +105,60 @@ class CentralisedStrategy:
             print(f"[CENTRAL][DECIDE] agent_id={agent_id} UNKNOWN → WAIT")
             return {"mode": "wait"}
 
-        # --------------------------------------------------
+        # ==================================================
         # 2. Resolve station (single-station assumption)
-        # --------------------------------------------------
+        # ==================================================
         if not stations:
             print(f"[CENTRAL][DECIDE] agent_id={agent_id} NO_STATION → IDLE")
             return {"mode": "idle"}
 
         station = stations[0]
 
-        # --------------------------------------------------
+        # ==================================================
         # 3. Reuse existing assignment if still valid
-        # --------------------------------------------------
+        # ==================================================
         existing = self.assignments.get(agent_id)
-        if existing is not None:
+        if existing:
             parcel = next(
                 (p for p in parcels if p["id"] == existing["parcel_id"]),
                 None,
             )
 
-            # VALID ASSIGNMENT CONDITIONS
-            if parcel is not None and not parcel.get("delivered", False):
+            # Assignment remains valid until the parcel is delivered
+            if parcel and not parcel.get("delivered", False):
                 drop_cell = self._best_station_entry_cell(parcel, station)
 
-                # Do NOT release just because it's not picked yet
+                print(
+                    f"[CENTRAL][DECIDE] agent_id={agent_id} "
+                    f"continuing assignment parcel={parcel['id']}"
+                )
+
                 return {
                     "mode": "plan",
-                    "plan": [
-                        {
-                            "pickup": (parcel["col"], parcel["row"]),
-                            "dropoff": drop_cell,
-                            "weight": parcel.get("weight", 1.0),
-                        }
-                    ],
-                    "confidence": 1.0,
-                    "strategy": "centralised-single-step",
-                    "narration": "Centralised assignment (authoritative)",
+                    "plan": {
+                        "plan": [
+                            {
+                                "pickup": (parcel["col"], parcel["row"]),
+                                "dropoff": drop_cell,
+                                "weight": parcel.get("weight", 1.0),
+                            }
+                        ],
+                        "confidence": 1.0,
+                        "strategy": "centralised-single-step",
+                        "narration": "Centralised assignment (authoritative)",
+                    },
                 }
 
-            # Truly invalid → release
+            # Parcel delivered or invalid → release assignment
             del self.assignments[agent_id]
             print(
                 f"[CENTRAL][DECIDE] agent_id={agent_id} released invalid assignment"
             )
 
-        # --------------------------------------------------
-        # 4. Filter available parcels
-        # --------------------------------------------------
-        reserved = {
-            rec["parcel_id"]
-            for rec in self.assignments.values()
-        }
+        # ==================================================
+        # 4. Identify globally available parcels
+        # ==================================================
+        reserved = {rec["parcel_id"] for rec in self.assignments.values()}
 
         available = [
             p for p in parcels
@@ -156,9 +174,9 @@ class CentralisedStrategy:
             )
             return {"mode": "wait"}
 
-        # --------------------------------------------------
-        # 5. Select nearest parcel (agent → pickup cost)
-        # --------------------------------------------------
+        # ==================================================
+        # 5. Select nearest parcel (greedy cost)
+        # ==================================================
         ax, ay = agent["col"], agent["row"]
 
         target = min(
@@ -166,9 +184,9 @@ class CentralisedStrategy:
             key=lambda p: abs(p["col"] - ax) + abs(p["row"] - ay),
         )
 
-        # --------------------------------------------------
+        # ==================================================
         # 6. Reserve assignment
-        # --------------------------------------------------
+        # ==================================================
         self.assignments[agent_id] = {
             "parcel_id": target["id"],
             "assigned_at": time.time(),
@@ -179,9 +197,9 @@ class CentralisedStrategy:
             f"assigned parcel={target['id']}"
         )
 
-        # --------------------------------------------------
-        # 7. Emit PLAN ENVELOPE (controller-compatible)
-        # --------------------------------------------------
+        # ==================================================
+        # 7. Emit controller-compatible plan envelope
+        # ==================================================
         drop_cell = self._best_station_entry_cell(target, station)
 
         return {
@@ -254,10 +272,7 @@ class CentralisedStrategy:
                 if not self._feasible(agent, parcel, station):
                     continue
 
-                cost = manhattan(
-                    (agent.col, agent.row),
-                    (parcel.col, parcel.row),
-                )
+                cost = self.physics.distance(a=(agent.col, agent.row), b=(parcel.col, parcel.row), )
 
                 if cost < best_cost:
                     best_cost = cost
@@ -329,21 +344,15 @@ class CentralisedStrategy:
         """
         Conservative feasibility test.
         """
-        to_parcel = manhattan(
-            (agent.col, agent.row),
-            (parcel.col, parcel.row),
-        )
+        to_parcel = self.physics.distance(a=(agent.col, agent.row), b=(parcel.col, parcel.row), )
 
-        to_station = manhattan(
-            (parcel.col, parcel.row),
-            station,
-        )
+        to_station = self.physics.distance(a=(parcel.col, parcel.row), b=station, )
 
         total_cells = to_parcel + to_station
 
         weight = getattr(parcel, "weight", 1.0)
 
-        est_cost = est_cost_cells(total_cells, weight)
+        est_cost = self.physics.energy_cost(distance=total_cells, payload=weight)
 
         return agent.power.level > est_cost
 
@@ -375,9 +384,7 @@ class CentralisedStrategy:
         assigned = set(self.assignments.keys())
         return [
             a for a in agents
-            if a.agent_id not in assigned
-               and a.power.level > 0.0
-               and getattr(a, "carrying", None) is None
+            if a.agent_id not in assigned and a.power.level > 0.0 and getattr(a, "carrying", None) is None
         ]
 
     def _free_parcels(self, parcels: List[Parcel]) -> List[Parcel]:
@@ -387,10 +394,7 @@ class CentralisedStrategy:
         }
 
         return [
-            p for p in parcels
-            if not p.delivered
-               and not p.picked
-               and p.id not in assigned_parcels
+            p for p in parcels if not p.delivered and not p.picked and p.id not in assigned_parcels
         ]
 
     def _get_station_center(self) -> Optional[Tuple[int, int]]:

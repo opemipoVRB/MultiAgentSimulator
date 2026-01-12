@@ -48,6 +48,15 @@ class BaseStrategy:
     """
     enable_reactive_fallback: bool = False
     requires_plan_completion_before_requery: bool = False
+    use_async_worker = False
+
+    def set_drone(self, drone):
+        """
+        Optional hook for strategies that need direct drone access
+        (e.g. SPPDEC with onboard SLM).
+        Default implementation is no-op.
+        """
+        self.drone = drone
 
     def decide(self, snapshot) -> Dict:
         """

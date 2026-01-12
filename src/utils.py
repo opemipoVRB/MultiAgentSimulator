@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 SurfaceOrPath = Union[pygame.Surface, Path, str]
 
+
 def load_image(path: Union[Path, str, None]) -> Optional[pygame.Surface]:
     """
     Load an image via pygame and return a Surface or None if loading failed.
@@ -59,15 +60,3 @@ def scale_to_cell(img: Optional[pygame.Surface], grid_size: int, scale_factor: f
             return pygame.transform.scale(img, (new_w, new_h))
         except Exception:
             return img
-
-
-def cell_center_from_grid(col: int, row: int, grid_size: int):
-    x = col * grid_size + grid_size / 2
-    y = row * grid_size + grid_size / 2
-    return pygame.Vector2(x, y)
-
-
-def grid_from_pos(pos: pygame.Vector2, grid_size: int):
-    col = int(pos.x // grid_size)
-    row = int(pos.y // grid_size)
-    return col, row

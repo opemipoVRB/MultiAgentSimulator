@@ -13,20 +13,27 @@ Behavior:
  - Supports per-strategy snapshots so an aborted run can resume from the exact world state.
  - Stores agents and comm_config; snapshot contains agents_state list.
 """
-import pygame
 import json
 import random
 import time
 import uuid
+import pygame
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from flight_recorder import FlightRecorder
-from artifacts import Terrain, Drone, Parcel, CommandCenter
-from controllers import HumanAgentController, AIAgentController, ControllerSwitcher
-from utils import load_image, scale_to_cell
+from src.artifacts import Terrain, Drone, Parcel
+from src.config import OLLAMA_MODE
+from src.controllers import HumanAgentController, AIAgentController, ControllerSwitcher
+from src.flight_recorder import FlightRecorder
+from src.physics.physics_2d import Grid2DPhysics
+from src.utils import load_image, scale_to_cell
+from src.system.capacity import SystemCapacityChecker, AgentCapacityError
 
-from src.strategies.centralised import CentralisedStrategy
-from src.strategies.naive import NaiveStrategy
+# ---------------------------------------------------------------------------
+#  Physics Coonfig
+# ---------------------------------------------------------------------------
+
+physics = Grid2DPhysics()
+NAIVE_NUM_TRIALS = 10  # Monte Carlo greedy rollouts per agent
 
 GRID_SIZE = 100
 SPEED = 420
@@ -181,6 +188,9 @@ class ExperimentRunnerGUI:
         self.max_steps = 60 * 60 * 5
         self.stall_seconds = 6.0  # if idle longer than this considered a stall when parcels remain
 
+        self.checker = SystemCapacityChecker()
+        self.system_limit = self.checker.max_supported_agents()
+
     def _show_modal(
             self,
             *,
@@ -268,7 +278,7 @@ class ExperimentRunnerGUI:
             exit_keys=None,  # any key or mouse
         )
 
-    def _show_error_and_restart_setup(self, message: str):
+    def _show_error_and_restart_setup(self, message: Optional[str] = None):
         """
         Show a configuration error and restart setup flow.
         """
@@ -304,7 +314,7 @@ class ExperimentRunnerGUI:
         Returns:
           (n_agents, n_parcels)
         """
-
+        max_agents = self.system_limit
         agents = initial_agents
         parcels = initial_parcels
         typing = ""
@@ -357,7 +367,15 @@ class ExperimentRunnerGUI:
 
             header = self.large_font.render("Experiment Setup", True, (230, 230, 230))
             self.screen.blit(header, header.get_rect(center=(self.screen_size[0] // 2, 140)))
-
+            limit_txt = self.font.render(
+                f"System agent limit: {max_agents}",
+                True,
+                (160, 160, 160),
+            )
+            self.screen.blit(
+                limit_txt,
+                limit_txt.get_rect(center=(self.screen_size[0] // 2, 190)),
+            )
             agents_color = (240, 240, 200) if active_field == "agents" else (180, 180, 180)
             parcels_color = (240, 240, 200) if active_field == "parcels" else (180, 180, 180)
 
@@ -627,12 +645,7 @@ class ExperimentRunnerGUI:
         # If we get here, we're creating a new experiment
         self._resumed = False
 
-    def _write_flight_artifacts(
-            self,
-            run_id: str,
-            planner: str,
-            flight_data: Dict,
-    ) -> Dict:
+    def _write_flight_artifacts(self, run_id, planner, strategy_name, flight_data):
         """
         Persist flight recorder data into the current experiment directory.
         """
@@ -640,17 +653,17 @@ class ExperimentRunnerGUI:
         if self.experiment_dir is None:
             raise RuntimeError("Experiment directory not initialized")
 
-        base_name = f"flight_{planner}"
+        # Create a subfolder per strategy
+        strategy_dir = self.experiment_dir / strategy_name
+        strategy_dir.mkdir(parents=True, exist_ok=True)
+
         paths = {}
 
-        agents_path = self.experiment_dir / f"{base_name}_agents.json"
-        agents_path.write_text(
-            json.dumps(flight_data["agents"], indent=2),
-            encoding="utf-8",
-        )
-        paths["agents"] = agents_path.name
+        agents_path = strategy_dir / "agents.json"
+        agents_path.write_text(json.dumps(flight_data["agents"], indent=2), encoding="utf-8")
+        paths["agents"] = f"{strategy_name}/agents.json"
 
-        fleet_path = self.experiment_dir / f"{base_name}_fleet.json"
+        fleet_path = strategy_dir / "fleet.json"
         fleet_path.write_text(
             json.dumps(
                 {
@@ -661,21 +674,21 @@ class ExperimentRunnerGUI:
             ),
             encoding="utf-8",
         )
-        paths["fleet"] = fleet_path.name
+        paths["fleet"] = f"{strategy_name}/fleet.json"
 
-        heatmap_path = self.experiment_dir / f"{base_name}_heatmap.json"
+        heatmap_path = strategy_dir / "heatmap.json"
         heatmap_path.write_text(
             json.dumps(flight_data["heatmap"], indent=2),
             encoding="utf-8",
         )
-        paths["heatmap"] = heatmap_path.name
+        paths["heatmap"] = f"{strategy_name}/heatmap.json"
 
-        meta_path = self.experiment_dir / f"{base_name}_meta.json"
+        meta_path = strategy_dir / "meta.json"
         meta_path.write_text(
             json.dumps(flight_data["meta"], indent=2),
             encoding="utf-8",
         )
-        paths["meta"] = meta_path.name
+        paths["meta"] = f"{strategy_name}/meta.json"
 
         return paths
 
@@ -690,7 +703,6 @@ class ExperimentRunnerGUI:
             json.dumps(self.experiment, indent=2),
             encoding="utf-8",
         )
-
 
     def _finalize_experiment_file(self):
         self.experiment["status"] = "completed"
@@ -746,7 +758,7 @@ class ExperimentRunnerGUI:
         if len(evs) % 500 == 0:
             self._write_experiment_json()
 
-    def _make_snapshot(self, planner_name: str, agents: List[Drone], terrain: Terrain, steps: int) -> Dict:
+    def _make_terrain_snapshot(self, planner_name: str, agents: List[Drone], terrain: Terrain, steps: int) -> Dict:
         """
         Create a compact snapshot capturing parcels, agents' states, and steps elapsed.
         agents is a list of Drone instances in the same order as self.experiment['agents'].
@@ -759,7 +771,7 @@ class ExperimentRunnerGUI:
         if steps <= 0:
             raise ValueError("Refusing to create snapshot with zero steps")
 
-        # map existing experiment parcels (by position) to their ids
+        # map existing experiment parce_make_snapshotls (by position) to their ids
         id_map = {}
         for pdef in self.experiment.get("parcels", []):
             key = (int(pdef["col"]), int(pdef["row"]))
@@ -778,7 +790,7 @@ class ExperimentRunnerGUI:
             })
 
         agents_state = []
-        # In _make_snapshot method, update the agents_state loop:
+        # In _make_terrain_snapshot method, update the agents_state loop:
         for idx, agent in enumerate(agents):
             carried_id = None
             if getattr(agent, "carrying", None):
@@ -805,7 +817,7 @@ class ExperimentRunnerGUI:
             "parcels": parcels_snap,
         }
 
-    def _restore_snapshot(self, snapshot: Dict) -> Tuple[Terrain, List[Drone], int, List[Parcel]]:
+    def _restore_snapshot(self, snapshot: Dict, strategy_name: str) -> Tuple[Terrain, List[Drone], int, List[Parcel]]:
         """
         Restore world state from a snapshot and return (terrain, agents_list, steps, parcels).
         Snapshot is authoritative.
@@ -851,26 +863,20 @@ class ExperimentRunnerGUI:
         recreated_parcels: List[Parcel] = []
 
         for ps in snapshot.get("parcels", []):
-            # Get parcel ID from snapshot
             snapshot_parcel_id = ps.get("id")
 
-            # Create parcel (this will auto-generate a new UUID)
             p = Parcel(
                 int(ps["col"]),
                 int(ps["row"]),
                 terrain.grid_size
             )
 
-            # Override the auto-generated ID with the one from snapshot
-            # This ensures we preserve the same IDs across save/load cycles
             if snapshot_parcel_id is not None:
-                p.id = str(snapshot_parcel_id)  # Ensure it's a string
+                p.id = str(snapshot_parcel_id)
 
-            # Restore parcel state
             p.picked = bool(ps.get("picked", False))
             p.delivered = bool(ps.get("delivered", False))
 
-            # Restore weight if available
             if "weight" in ps:
                 p.weight = float(ps["weight"])
 
@@ -882,11 +888,12 @@ class ExperimentRunnerGUI:
         terrain.parcels = recreated_parcels
 
         # ----------------------------
-        # Recreate agents
+        # Recreate agents (with onboard SLM)
         # ----------------------------
         agents: List[Drone] = []
+        base_port = 11434
 
-        for astate in agents_state:
+        for idx, astate in enumerate(agents_state):
             agent_id = astate["agent_id"]
 
             drone = Drone(
@@ -906,19 +913,17 @@ class ExperimentRunnerGUI:
             drone.row = int(astate["row"])
             drone.last_cell = (drone.col, drone.row)
 
-            # battery
+            # battery restore
             cap = float(astate.get("battery_capacity", drone.power.capacity))
             lvl = float(astate.get("battery_level", drone.power.level))
             drone.power.capacity = cap
             drone.power.level = min(lvl, cap)
 
-            # carried parcel - match by ID
+            # carried parcel restore
             carrying_id = astate.get("carrying_id")
             if carrying_id is not None:
-                # Convert to string for comparison
                 carrying_id_str = str(carrying_id)
 
-                # Find parcel by ID
                 for p in recreated_parcels:
                     if getattr(p, "id", None) == carrying_id_str:
                         drone.carrying = p
@@ -926,7 +931,20 @@ class ExperimentRunnerGUI:
                         break
                 else:
                     print(
-                        f"[RESTORE] WARNING: Agent {agent_id} should be carrying parcel {carrying_id_str} but it wasn't found")
+                        f"[RESTORE] WARNING: Agent {agent_id} should be carrying parcel {carrying_id_str} but it wasn't found"
+                    )
+
+            # ----------------------------
+            # Restore embodied cognition
+            # ----------------------------
+            if OLLAMA_MODE == "external":
+                drone.slm_base_url = "http://127.0.0.1:11434"
+                drone.slm_enabled = True
+                print(f"[RESTORE][SLM] Using external Ollama for {agent_id}")
+            else:
+                slm_port = base_port + idx + 1
+                print(f"[RESTORE][SLM] Restarting {agent_id} on port {slm_port}")
+                drone.start_slm(port=slm_port)
 
             terrain.register_agent_cell(drone, drone.col, drone.row)
             terrain.agents[drone.agent_id] = drone
@@ -1065,7 +1083,7 @@ class ExperimentRunnerGUI:
         """
         print(f"[PLANNER] using planner '{name}' (no runtime configuration)")
 
-    def _setup_agents(self, terrain: Terrain):
+    def _setup_agents(self, terrain: Terrain, *, strategy_name: str):
         agents = {}
 
         station = terrain.nearest_station(
@@ -1094,7 +1112,15 @@ class ExperimentRunnerGUI:
                 "Reduce the number of agents."
             )
 
-        for agent_def, start_cell in zip(self.experiment["agents"], station_cells):
+        # ----------------------------------------
+        # SLM port allocation (infrastructure-level)
+        # ----------------------------------------
+        base_port = 11434  # standard Ollama base
+        used_ports = set()
+
+        for idx, (agent_def, start_cell) in enumerate(
+                zip(self.experiment["agents"], station_cells)
+        ):
             drone = Drone(
                 start_cell=start_cell,
                 grid_size=GRID_SIZE,
@@ -1103,13 +1129,31 @@ class ExperimentRunnerGUI:
                 agent_id=agent_def["id"],
             )
 
+            # -------------------------------
+            # Assign SLM port deterministically
+            # -------------------------------
+            if strategy_name.startswith("sppdec"):
+                if OLLAMA_MODE == "external":
+                    drone.slm_base_url = "http://127.0.0.1:11434"
+                    drone.slm_enabled = True
+                    print(f"[SLM] Using external Ollama for {drone.agent_id}")
+                else:
+                    slm_port = base_port + idx + 1
+                    used_ports.add(slm_port)
+                    drone.start_slm(port=slm_port)
+                    print(f"[SLM] Booting {drone.agent_id} on port {slm_port}")
+
             agents[agent_def["id"]] = drone
             terrain.register_agent_cell(drone, start_cell[0], start_cell[1])
             terrain.agents[drone.agent_id] = drone
 
+        if used_ports:
+            print(f"[SLM] Active ports: {sorted(used_ports)}")
+
         return agents, 0, None
 
-    def _setup_scene(self, maybe_snapshot: Optional[Dict] = None) -> Tuple[Terrain, List[Drone], int, List[Parcel]]:
+    def _setup_scene(self, maybe_snapshot: Optional[Dict], strategy_name: str) -> Tuple[
+        Terrain, List[Drone], int, List[Parcel]]:
         """
         Create Terrain and agents.
         If maybe_snapshot provided, restore world state from it.
@@ -1118,7 +1162,9 @@ class ExperimentRunnerGUI:
 
         # ---- Snapshot path (AUTHORITATIVE) ----
         if maybe_snapshot is not None:
-            terrain, agents, steps, all_parcels = self._restore_snapshot(maybe_snapshot)  # Changed to 4 values
+            terrain, agents, steps, all_parcels = self._restore_snapshot(maybe_snapshot,
+                                                                         strategy_name)  # Changed to 4 values
+            self._active_drones = agents
             return terrain, agents, steps, all_parcels
 
         # ---- Fresh scene path (from experiment schema) ----
@@ -1151,7 +1197,7 @@ class ExperimentRunnerGUI:
                 p.delivered = bool(pdef.get("delivered", False))
 
         # 3. Agents
-        agents_dict, steps, error = self._setup_agents(terrain)
+        agents_dict, steps, error = self._setup_agents(terrain, strategy_name=strategy_name)
         if error:
             self._show_error_and_restart_setup(error)
             raise RuntimeError("Restart setup")
@@ -1254,55 +1300,28 @@ class ExperimentRunnerGUI:
             status: str,
             planner_name: str,
             strategy_name: str,
-            strategy_mode: str,
+            strategy_type: str,
             steps: int,
             metrics: MetricsAccumulator,
             flight_recorder: FlightRecorder,
     ):
-        """
-        Finalize exactly one strategy run.
-
-        This is the ONLY place allowed to:
-          - finalize metrics
-          - export artifacts
-          - append to experiment["results"]
-          - update strategy state
-          - advance experiment progress
-          - emit experiment-level lifecycle logs
-        """
-
         assert status in {"completed", "aborted", "failed"}, f"Invalid status: {status}"
 
-        # -------------------------------------------------
-        # ENTRY LOG
-        # -------------------------------------------------
         print(
             f"[FINALIZE] Strategy {idx} '{strategy_name}' | "
-            f"mode={strategy_mode} | planner={planner_name} | "
+            f"mode={strategy_type} | planner={planner_name} | "
             f"status={status} | steps={steps}"
         )
 
         # -------------------------------------------------
-        # Finalize metrics (EXACTLY ONCE)
-        # -------------------------------------------------
-        metrics.finalize(
-            steps,
-            battery_capacity=metrics.fields["battery_capacity"],
-            battery_level=metrics.fields["battery_capacity"] - metrics.total_energy_consumed,
-        )
-
-        print(
-            f"[FINALIZE] Metrics finalized | "
-            f"energy_used={metrics.total_energy_consumed:.3f}"
-        )
-
-        # -------------------------------------------------
-        # Export flight artifacts
+        # Export flight artifacts first
         # -------------------------------------------------
         flight_data = flight_recorder.export()
+
         artifact_paths = self._write_flight_artifacts(
             run_id=self.experiment["run_id"],
             planner=planner_name,
+            strategy_name=strategy_name,
             flight_data=flight_data,
         )
 
@@ -1312,17 +1331,64 @@ class ExperimentRunnerGUI:
         )
 
         # -------------------------------------------------
-        # Append result (EXACTLY ONCE)
+        # Derive authoritative metrics from FlightRecorder
+        # -------------------------------------------------
+        agents = flight_data.get("agents", [])
+        fleet_events = flight_data.get("fleet_events", [])
+
+        total_distance = sum(a.get("distance_cells", 0.0) for a in agents)
+
+        total_energy_consumed = 0.0
+        for a in agents:
+            energy_series = a.get("energy", [])
+            if len(energy_series) >= 2:
+                start = energy_series[0]["battery_pct"]
+                end = energy_series[-1]["battery_pct"]
+                total_energy_consumed += max(0.0, start - end)
+
+        tasks_completed = sum(len(a.get("tasks", [])) for a in agents)
+        unsafe_failures = len([e for e in fleet_events if e.get("type") == "collision"])
+
+        runtime_seconds = round(time.time() - metrics.start_time, 3)
+
+        derived_metrics = {
+            "run_id": self.experiment["run_id"],
+            "planner": planner_name,
+            "seed": self.experiment["seed"],
+            "n_drones": len(agents),
+            "n_parcels": len(self.experiment.get("parcels", [])),
+            "comm_reliability": self.experiment.get("comm_config", {}).get("reliability", 1.0),
+            "battery_capacity": metrics.fields.get("battery_capacity", 100.0),
+            "episodic_interval": 1.0,
+            "total_energy_consumed": round(total_energy_consumed, 3),
+            "total_distance_traveled": round(total_distance, 3),
+            "tasks_completed": tasks_completed,
+            "mission_makespan_steps": steps,
+            "unsafe_failures": unsafe_failures,
+            "messages_sent": 0,
+            "runtime_seconds": runtime_seconds,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        print(
+            f"[FINALIZE] Derived metrics | "
+            f"distance={derived_metrics['total_distance_traveled']:.2f} | "
+            f"energy={derived_metrics['total_energy_consumed']:.3f} | "
+            f"tasks={tasks_completed}"
+        )
+
+        # -------------------------------------------------
+        # Append result
         # -------------------------------------------------
         self.experiment["results"].append({
             "strategy_index": idx,
             "strategy_name": strategy_name,
-            "strategy_mode": strategy_mode,
+            "strategy_type": strategy_type,
             "planner": planner_name,
             "seed": self.experiment["seed"],
             "status": status,
             "steps_executed": steps,
-            "metrics": metrics.as_dict(),
+            "metrics": derived_metrics,
             "artifacts": artifact_paths,
         })
 
@@ -1358,10 +1424,224 @@ class ExperimentRunnerGUI:
             )
 
         # -------------------------------------------------
+        # Shutdown SLMs
+        # -------------------------------------------------
+        active_drones = getattr(self, "_active_drones", [])
+        slm_users = [d for d in active_drones if getattr(d, "slm_enabled", False)]
+
+        if slm_users:
+            print("[SLM] Shutting down all drone SLM instances")
+
+        for drone in slm_users:
+            try:
+                drone.stop_slm()
+                print(f"[SLM] Stopped {drone.agent_id}")
+            except Exception as e:
+                print(f"[SLM] Failed to stop {drone.agent_id}: {e}")
+
+        # -------------------------------------------------
         # Persist experiment state
         # -------------------------------------------------
         print("[FINALIZE] Persisting experiment state to disk")
         self._write_experiment_json()
+
+    def _show_experiment_complete_screen(self, terrain, agents, duration: float = 3.0):
+        """
+        Final blocking screen shown once ALL strategies are completed.
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < duration:
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    pygame.quit()
+                    raise SystemExit()
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    return
+
+            self.screen.fill((192, 192, 192))
+
+            # grid
+            for x in range(0, self.screen_size[0], GRID_SIZE):
+                pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
+            for y in range(0, self.screen_size[1], GRID_SIZE):
+                pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+
+            terrain.draw(self.screen)
+            for drone in agents:
+                drone.draw(self.screen, self.images)
+
+            msg = self.large_font.render("EXPERIMENT COMPLETE", True, (0, 180, 0))
+            self.screen.blit(msg, msg.get_rect(center=(self.screen_size[0] // 2, 120)))
+
+            pygame.display.flip()
+            self.clock.tick(30)
+
+    def _show_post_run_inspection(
+            self,
+            *,
+            terrain,
+            agents,
+            strategy_name: str,
+            status: str,
+            variant: Optional[str] = None,
+            config: Optional[dict] = None,
+            seconds: int = 3,
+    ):
+        """
+        Show final strategy state briefly, then auto-advance to next strategy.
+        """
+        start_time = time.time()
+
+        while True:
+            elapsed = time.time() - start_time
+            remaining = seconds - int(elapsed)
+
+            if remaining <= 0:
+                return  # auto-continue to next strategy
+
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    pygame.quit()
+                    raise SystemExit()
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    return  # allow manual skip
+
+            self.screen.fill((192, 192, 192))
+
+            # grid
+            for x in range(0, self.screen_size[0], GRID_SIZE):
+                pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
+            for y in range(0, self.screen_size[1], GRID_SIZE):
+                pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+
+            terrain.draw(self.screen)
+            for drone in agents:
+                drone.draw(self.screen, self.images)
+
+            title_text = strategy_name
+            if variant:
+                title_text = f"{strategy_name} ({variant})"
+
+            title = self.large_font.render(
+                f"Strategy Finished: {title_text}",
+                True,
+                (50, 50, 50),
+            )
+
+            status_text = self.font.render(
+                f"Status: {status.upper()}",
+                True,
+                (80, 80, 80),
+            )
+
+            countdown_text = self.font.render(
+                f"Next strategy in {remaining}s",
+                True,
+                (100, 100, 100),
+            )
+
+            self.screen.blit(title, title.get_rect(center=(self.screen_size[0] // 2, 80)))
+            self.screen.blit(status_text, status_text.get_rect(center=(self.screen_size[0] // 2, 130)))
+            self.screen.blit(countdown_text, countdown_text.get_rect(center=(self.screen_size[0] // 2, 160)))
+
+            if config:
+                y = 200
+                for k, v in config.items():
+                    txt = self.font.render(f"{k}: {v}", True, (90, 90, 90))
+                    self.screen.blit(txt, txt.get_rect(center=(self.screen_size[0] // 2, y)))
+                    y += 28
+
+            pygame.display.flip()
+            self.clock.tick(30)
+
+    def _show_strategy_countdown(
+            self,
+            *,
+            terrain,
+            agents,
+            strategy_name: str,
+            topology: str,
+            seconds: int = 5,
+            variant: Optional[str] = None,
+            config: Optional[dict] = None
+    ) -> bool:
+        """
+        Overlay countdown shown before a strategy starts.
+
+        This screen is rendered directly on top of the active terrain
+        to preserve spatial and experimental continuity.
+        """
+        start_time = time.time()
+
+        while True:
+            elapsed = time.time() - start_time
+            remaining = seconds - int(elapsed)
+
+            if remaining <= 0:
+                return True
+
+            for e in pygame.event.get():
+                if e.type == pygame.QUIT:
+                    pygame.quit()
+                    raise SystemExit()
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    return False
+
+            # -------------------------------------------------
+            # Draw world
+            # -------------------------------------------------
+            self.screen.fill((192, 192, 192))
+
+            for x in range(0, self.screen_size[0], GRID_SIZE):
+                pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
+            for y in range(0, self.screen_size[1], GRID_SIZE):
+                pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
+
+            terrain.draw(self.screen)
+            for drone in agents:
+                drone.draw(self.screen, self.images)
+
+            # -------------------------------------------------
+            # Overlay info
+            # -------------------------------------------------
+            overlay_y = 110
+
+            title = self.large_font.render("NEXT STRATEGY", True, (80, 120, 200))
+            self.screen.blit(title, title.get_rect(center=(self.screen_size[0] // 2, overlay_y)))
+
+            overlay_y += 70
+
+            name_text = strategy_name
+            if variant:
+                name_text = f"{strategy_name} ({variant})"
+
+            name = self.title_font.render(name_text.upper(), True, (20, 20, 20))
+            self.screen.blit(name, name.get_rect(center=(self.screen_size[0] // 2, overlay_y)))
+
+            overlay_y += 50
+
+            meta = [f"Topology: {topology}"]
+
+            if config:
+                for k, v in config.items():
+                    meta.append(f"{k}: {v}")
+
+            for line in meta:
+                txt = self.font.render(line, True, (40, 40, 40))
+                self.screen.blit(txt, txt.get_rect(center=(self.screen_size[0] // 2, overlay_y)))
+                overlay_y += 34
+
+            overlay_y += 30
+
+            countdown = self.large_font.render(str(remaining), True, (200, 100, 40))
+            self.screen.blit(countdown, countdown.get_rect(center=(self.screen_size[0] // 2, overlay_y)))
+
+            hint = self.font.render("Press ESC to skip this strategy", True, (90, 90, 90))
+            self.screen.blit(hint, hint.get_rect(center=(self.screen_size[0] // 2, self.screen_size[1] - 100)))
+
+            pygame.display.flip()
+            self.clock.tick(30)
 
     def run(self):
         # -------------------------------------------------
@@ -1390,11 +1670,18 @@ class ExperimentRunnerGUI:
                     n_agents, n_parcels = self.show_experiment_setup(
                         initial_agents=1,
                         initial_parcels=self.parcels,
+                        max_agents=self.system_limit,
                     )
                     # Persist for downstream use
                     self.parcels = n_parcels
 
                     selected_planner = self.show_setup_and_planner_select()
+                    # Enforce physical feasibility for SPPDEC agents only
+                    try:
+                        self.checker.enforce(n_agents)
+                    except AgentCapacityError as e:
+                        self._show_error_and_restart_setup(str(e))
+                        continue
 
                     self._load_or_create_experiment()
                     break
@@ -1416,14 +1703,57 @@ class ExperimentRunnerGUI:
             strategies = [
                 {
                     "name": "naive_decentralized",
-                    "mode": "decentralized",
+                    "strategy_type": "naive",
+                    "topology": "decentralized",
                     "planner": selected_planner,
                     "snapshot": None,
                     "status": "pending",
                 },
                 {
                     "name": "centralized_cc",
-                    "mode": "centralized",
+                    "strategy_type": "centralized",
+                    "topology": "centralized",
+                    "planner": selected_planner,
+                    "snapshot": None,
+                    "status": "pending",
+                },
+
+                # -------------------------------
+                # SPPDEC Experimental Variants
+                # -------------------------------
+
+                {
+                    "name": "sppdec",
+                    "variant": "control",  # baseline_payload=0.0, alpha=0.0
+                    "strategy_type": "sppdec",
+                    "topology": "predictive_decentralized",
+                    "planner": selected_planner,
+                    "snapshot": None,
+                    "status": "pending",
+                },
+                {
+                    "name": "sppdec",
+                    "variant": "baseline_only",  # baseline_payload=0.15, alpha=0.0
+                    "strategy_type": "sppdec",
+                    "topology": "predictive_decentralized",
+                    "planner": selected_planner,
+                    "snapshot": None,
+                    "status": "pending",
+                },
+                {
+                    "name": "sppdec",
+                    "variant": "fairness_only",  # baseline_payload=0.0, alpha=0.02
+                    "strategy_type": "sppdec",
+                    "topology": "predictive_decentralized",
+                    "planner": selected_planner,
+                    "snapshot": None,
+                    "status": "pending",
+                },
+                {
+                    "name": "sppdec",
+                    "variant": "combined",  # baseline_payload=0.15, alpha=0.02
+                    "strategy_type": "sppdec",
+                    "topology": "predictive_decentralized",
                     "planner": selected_planner,
                     "snapshot": None,
                     "status": "pending",
@@ -1519,48 +1849,52 @@ class ExperimentRunnerGUI:
             # Reset completion wait counter for this strategy
             if hasattr(self, '_completion_wait_counter'):
                 del self._completion_wait_counter
-            strategy_name = strategy.get("name", f"strategy_{idx}")
-            strategy_mode = strategy.get("mode", "unknown")
+            base_name = strategy.get("name", f"strategy_{idx}")
+            variant = strategy.get("variant")
+
+            if base_name == "sppdec" and variant:
+                strategy_name = f"sppdec_{variant}"
+            else:
+                strategy_name = base_name
+
+            strategy_type = strategy.get("strategy_type", "unknown")
+            topology = strategy.get("topology", "unknown")
             planner_name = strategy["planner"]
             print(f"[EXPERIMENT] Running planner '{planner_name}' ({idx + 1}/{len(self.experiment['strategies'])})"
                   f"Current Strategy {strategy_name}"
-                  f"Strategy mode {strategy_mode}")
+                  f"Strategy mode {topology}")
 
             self._configure_planner(planner_name)
 
             snapshot = strategy.get("snapshot")
             try:
-                terrain, agents, pre_steps, all_parcels = self._setup_scene(snapshot)
+                terrain, agents, pre_steps, all_parcels = self._setup_scene(snapshot, strategy_name)
 
-                # strategy_mode = "naive"  # strategy.get("mode", "decentralized")
-                # strategy_mode = "centralized"
-                strategy_mode = strategy.get("mode", "decentralized")
-                if strategy_mode == "centralized":
-                    station = terrain.stations[0]
-                    cc_col = station.col + station.w // 2
-                    cc_row = station.row + station.h // 2
+                proceed = self._show_strategy_countdown(
+                    terrain=terrain,
+                    agents=agents,
+                    strategy_name=strategy_name,
+                    topology=topology,
+                    variant=variant,
+                    config=strategy.get("config")
+                )
 
-                    command_center = CommandCenter(
-                        col=cc_col,
-                        row=cc_row,
+                if not proceed:
+                    print("[EXPERIMENT] Strategy skipped by user")
+                    continue
+
+                from src.strategies.factory import build_strategy
+                strategies = {}
+                for drone in agents:
+                    import copy
+                    strategies[drone.agent_id] = build_strategy(
+                        strategy_spec=copy.deepcopy(strategy),
+                        terrain=terrain,
+                        agents=agents,
+                        physics=physics,
+                        graphics_dir=GRAPHICS_DIR,
                         grid_size=GRID_SIZE,
-                        network_capacity=100.0,
-                        network_range=8,
-                        image_path=str(GRAPHICS_DIR / "command_center.png"),
                     )
-
-                    terrain.command_center = command_center
-                    terrain.command_center.bind_terrain(terrain)
-                    if terrain.command_center:
-                        for drone in agents:
-                            terrain.command_center.register_agent(drone)
-
-                    strategy = CentralisedStrategy()
-
-                else:
-                    terrain.command_center = None
-
-                    strategy = NaiveStrategy(num_trials=10)
 
             except AgentSpawnError as e:
                 self._show_error_and_restart_setup(str(e))
@@ -1577,6 +1911,7 @@ class ExperimentRunnerGUI:
             flight_recorder = FlightRecorder(
                 run_id=run_id,
                 planner=planner_name,
+                strategy_name=strategy_name,
                 agents=self.experiment["agents"],
                 parcels=self.experiment["parcels"],  # Still pass initial parcel definitions
                 grid_size=GRID_SIZE,
@@ -1607,15 +1942,18 @@ class ExperimentRunnerGUI:
                     ai = AIAgentController(
                         drone=drone,
                         terrain=terrain,
-                        strategy=strategy,
+                        strategy=strategies[agent_id],
                         flight_recorder=flight_recorder
-
                     )
+                    strategies[agent_id].set_drone(drone)
                     print("Drone", drone)
                     print("Drone ID", drone.agent_id)
                     switcher = ControllerSwitcher([human, ai])
                     switcher.index = 1
                     controllers[agent_id] = switcher
+
+                from concurrent.futures import ThreadPoolExecutor
+                executor = ThreadPoolExecutor(max_workers=len(agents))
 
                 metrics = MetricsAccumulator(
                     run_id=self.experiment["run_id"],
@@ -1759,7 +2097,7 @@ class ExperimentRunnerGUI:
                                     status="completed",
                                     planner_name=planner_name,
                                     strategy_name=strategy_name,
-                                    strategy_mode=strategy_mode,
+                                    strategy_type=strategy_type,
                                     steps=steps,
                                     metrics=metrics,
                                     flight_recorder=flight_recorder,
@@ -1806,35 +2144,57 @@ class ExperimentRunnerGUI:
                         # If we reach here, mission was truly aborted mid-run
                         snap = None
                         try:
-                            snap = self._make_snapshot(planner_name, agents, terrain, steps)
+                            snap = self._make_terrain_snapshot(planner_name, agents, terrain, steps)
                         except ValueError:
                             pass
 
                         self.experiment["strategies"][idx]["snapshot"] = snap
+                        self.experiment["strategies"][idx]["status"] = "aborted"
+                        self.experiment["status"] = "in_progress"
+                        self._write_experiment_json()
 
-                        self._finalize_strategy(
-                            idx=idx,
-                            status="aborted",
-                            planner_name=planner_name,
-                            strategy_name=strategy_name,
-                            strategy_mode=strategy_mode,
-                            steps=steps,
-                            metrics=metrics,
-                            flight_recorder=flight_recorder,
-                        )
-
-                        print("[EXPERIMENT] Mission aborted mid-run")
-                        strategy_finished = True
-                        break
+                        print("[EXPERIMENT] Mission aborted mid-run (checkpoint saved)")
+                        return  # exit runner so resume flow can pick it up cleanly
 
                     dt = self.clock.tick(60) / 1000.0
 
                     # ------------------------------
                     # UPDATE AGENTS
                     # ------------------------------
+                    # ==============================
+                    # PHASE 1: Collect decisions in parallel
+                    # ==============================
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    if not hasattr(self, "_executor"):
+                        self._executor = ThreadPoolExecutor(max_workers=len(agents))
+
+                    executor = self._executor
+
+                    futures = {}
+
                     for i, drone in enumerate(agents):
                         agent_id = self.experiment["agents"][i]["id"]
+                        controller = controllers[agent_id]
+
+                        if controller.needs_decision():
+                            futures[agent_id] = executor.submit(controller.compute_decision)
+
+                    # Barrier: wait for all to finish
+                    decisions = {aid: fut.result() for aid, fut in futures.items()}
+
+                    # Commit all decisions at the same logical time
+                    for agent_id, decision in decisions.items():
+                        controllers[agent_id].apply_decision(decision)
+
+                    # ==============================
+                    # PHASE 2: Physics + execution
+                    # ==============================
+                    for i, drone in enumerate(agents):
+                        agent_id = self.experiment["agents"][i]["id"]
+
                         controllers[agent_id].update(dt, steps, sim_time)
+
                         drone.update(
                             dt,
                             SPEED,
@@ -1863,8 +2223,8 @@ class ExperimentRunnerGUI:
                             sim_time=sim_time,
                         )
 
-                        if hasattr(drone, "_last_action") and drone._last_action:
-                            kind, cell, parcel = drone._last_action
+                        if hasattr(drone, "last_action") and drone.last_action:
+                            kind, cell, parcel = drone.last_action
                             last_action_time = time.time()
 
                             # -------------------------------------------------
@@ -1902,7 +2262,7 @@ class ExperimentRunnerGUI:
                                 {"step": steps, "type": kind, "agent": agent_id, "cell": cell},
                             )
 
-                            drone._last_action = None
+                            drone.last_action = None
 
                     # -------------------------------------------------
                     # >>> FLIGHT RECORDER: fleet-level checks
@@ -1946,13 +2306,12 @@ class ExperimentRunnerGUI:
                     # 3. HARD FAILURE: mission impossible
                     # ---------------------------------------------
                     if not alive_agents and not self.all_parcels_delivered(terrain):
-
                         self._finalize_strategy(
                             idx=idx,
                             status="failed",
                             planner_name=planner_name,
                             strategy_name=strategy_name,
-                            strategy_mode=strategy_mode,
+                            strategy_type=strategy_type,
                             steps=steps,
                             metrics=metrics,
                             flight_recorder=flight_recorder,
@@ -1987,7 +2346,7 @@ class ExperimentRunnerGUI:
                             status=status,
                             planner_name=planner_name,
                             strategy_name=strategy_name,
-                            strategy_mode=strategy_mode,
+                            strategy_type=strategy_type,
                             steps=steps,
                             metrics=metrics,
                             flight_recorder=flight_recorder,
@@ -2013,7 +2372,7 @@ class ExperimentRunnerGUI:
                         # ----------------------------
                         # Drone network pulse (visual only)
                         # ----------------------------
-                        if strategy_mode in ("naive", "novel", "centralized"):
+                        if strategy_type in ("naive", "novel", "centralized"):
                             drone.draw_network_pulse(
                                 self.screen,
                                 min_cells=1,
@@ -2027,65 +2386,24 @@ class ExperimentRunnerGUI:
                     break
 
                 # -------------------------------------------------
-                # POST-RUN CLEANUP
+                # POST-RUN UI (per strategy)
                 # -------------------------------------------------
-                # Update the post-run inspection section:
-                if self.experiment["status"] == "completed":
-                    print("[EXPERIMENT] All strategies completed. Experiment marked as complete.")
-
-                    # Show completion message briefly, then exit
-                    completion_time = 3.0  # Show for 3 seconds
-                    start_time = time.time()
-
-                    while time.time() - start_time < completion_time:
-                        for e in pygame.event.get():
-                            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
-                                break
-
-                        # Redraw final world state
-                        self.screen.fill((192, 192, 192))
-                        for x in range(0, self.screen_size[0], GRID_SIZE):
-                            pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
-                        for y in range(0, self.screen_size[1], GRID_SIZE):
-                            pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
-
-                        terrain.draw(self.screen)
-                        for drone in agents:
-                            drone.draw(self.screen, self.images)
-
-                        # Show completion message
-                        msg = self.large_font.render("MISSION COMPLETE!", True, (0, 200, 0))
-                        self.screen.blit(msg, msg.get_rect(center=(self.screen_size[0] // 2, 100)))
-
-                        pygame.display.flip()
-                        self.clock.tick(30)
-
-                    break  # break out of strategy loop, not run()
+                if idx < len(self.experiment["strategies"]) - 1:
+                    # There are more strategies to run
+                    self._show_post_run_inspection(
+                        terrain=terrain,
+                        agents=agents,
+                        strategy_name=strategy_name,
+                        status=self.experiment["strategies"][idx]["status"],
+                        variant=variant,
+                        config=strategy.get("config")
+                    )
+                    continue
                 else:
-                    # Only show post-run inspection if mission was aborted
-                    print("[EXPERIMENT] Entering post-run inspection mode. Press ESC to exit.")
+                    # This was the last strategy
+                    self._show_experiment_complete_screen(terrain, agents)
+                    break
 
-                    inspecting = True
-                    while inspecting:
-                        for e in pygame.event.get():
-                            if e.type == pygame.QUIT:
-                                inspecting = False
-                            elif e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
-                                inspecting = False
-
-                        # redraw final world state
-                        self.screen.fill((192, 192, 192))
-                        for x in range(0, self.screen_size[0], GRID_SIZE):
-                            pygame.draw.line(self.screen, (200, 200, 200), (x, 0), (x, self.screen_size[1]))
-                        for y in range(0, self.screen_size[1], GRID_SIZE):
-                            pygame.draw.line(self.screen, (200, 200, 200), (0, y), (self.screen_size[0], y))
-
-                        terrain.draw(self.screen)
-                        for drone in agents:
-                            drone.draw(self.screen, self.images)
-
-                        pygame.display.flip()
-                        self.clock.tick(30)
             finally:
                 try:
                     flight_recorder.finalize()
@@ -2101,5 +2419,16 @@ def main():
         pygame.quit()
 
 
+# if __name__ == "__main__":
+#     main()
+
 if __name__ == "__main__":
+    import cProfile
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+
     main()
+
+    profiler.disable()
+    profiler.dump_stats("profile_results.prof")

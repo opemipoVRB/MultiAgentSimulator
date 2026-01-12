@@ -1,13 +1,18 @@
 # src/artifacts.py
-import random
-import math
 import heapq
-from typing import List, Tuple, Optional, Iterable, Dict
-from resources import PowerResource, NetworkResource
-from collections import defaultdict, deque
-import pygame
-import uuid
+import math
+import random
 import time
+import uuid
+import pygame
+import requests
+from collections import defaultdict
+from typing import List, Tuple, Optional, Iterable, Dict
+from src.config import OLLAMA_MODELS_DIR, OLLAMA_MODEL, OLLAMA_MODE
+from src.resources import PowerResource, NetworkResource
+import threading
+
+SLM_SEMAPHORE = threading.Semaphore(4)  # allow only 2 concurrent generations
 
 
 # -------------------------
@@ -150,11 +155,20 @@ class Drone:
         self.anim_frame = 0
 
         # last action for UI
-        self._last_action = None
+        self.last_action = None
 
         # resources (PowerResource and NetworkResource must exist in file)
         self.power = PowerResource(capacity=battery_capacity)
         self.network = NetworkResource(capacity=100.0)
+        # -------------------------
+        # Onboard SLM (optional but embodied)
+        # -------------------------
+        self.slm_host = "127.0.0.1"  # always defined
+        self.ollama_port = None  # assigned when simulation boots
+        self.slm_base_url = None  # derived once port is known
+        self.slm_model = OLLAMA_MODEL
+        self.ollama_process = None
+        self.slm_enabled = False
 
         # lost flag when battery drained
         self.lost = False
@@ -450,7 +464,7 @@ class Drone:
 
         # Drone now carries the parcel
         self.carrying = parcel
-        self._last_action = ("pick", (self.col, self.row), parcel)
+        self.last_action = ("pick", (self.col, self.row), parcel)
 
         return True
 
@@ -477,7 +491,7 @@ class Drone:
         # A parcel cannot be placed into an occupied cell.
         # Occupancy includes delivered and undelivered parcels.
         if self.terrain.occupied_cell(self.col, self.row):
-            self._last_action = ("drop_blocked", (self.col, self.row), parcel)
+            self.last_action = ("drop_blocked", (self.col, self.row), parcel)
             return False
 
         # --------------------------------------------------
@@ -494,7 +508,7 @@ class Drone:
 
         # Drone no longer carries the parcel
         self.carrying = None
-        self._last_action = ("drop", (self.col, self.row), parcel)
+        self.last_action = ("drop", (self.col, self.row), parcel)
 
         # --------------------------------------------------
         # Battery depletion after action
@@ -522,7 +536,7 @@ class Drone:
     def to_snapshot(self) -> dict:
         """
         Return a compact planner-friendly snapshot for this drone.
-        Mirrors the fields used by AIAgentController._make_snapshot.
+        Mirrors the fields used by AIAgentController._make_terrain_snapshot.
         """
         return {
             "agent": {
@@ -710,6 +724,148 @@ class Drone:
         )
 
         surf.blit(overlay, (cx - radius, cy - radius))
+
+    def start_slm(self, port: int = 11434):
+        import subprocess, os, time, requests, socket
+
+        if OLLAMA_MODE == "external":
+            self.slm_base_url = f"http://{self.slm_host}:11434"
+            self.slm_enabled = True
+            return
+
+        self.slm_base_url = f"http://{self.slm_host}:{port}"
+
+        def server_healthy():
+            try:
+                r = requests.get(f"{self.slm_base_url}/api/version", timeout=0.5)
+                return r.status_code == 200
+            except Exception:
+                return False
+
+        # If already running and healthy, reuse
+        if server_healthy():
+            print(f"[SLM] Reusing healthy server on port {port}")
+            self.slm_enabled = True
+            return
+
+        # Start fresh server, no killing
+        env = os.environ.copy()
+        env["OLLAMA_HOST"] = f"{self.slm_host}:{port}"
+        env["OLLAMA_MODELS"] = os.path.abspath(os.path.expanduser(OLLAMA_MODELS_DIR))
+        print(f"[SLM] Using model dir: {env['OLLAMA_MODELS']}")
+
+        self.ollama_process = subprocess.Popen(
+            ["ollama", "serve"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+
+        # Wait until healthy
+        for _ in range(60):
+            if server_healthy():
+                self.slm_enabled = True
+                return
+            time.sleep(0.2)
+
+        raise RuntimeError(f"Ollama failed to boot on port {port}")
+
+    def stop_slm(self):
+        """
+        Cleanly shutdown the onboard SLM instance.
+        """
+        import os
+        import signal
+
+        if not self.slm_enabled or not self.ollama_process:
+            return
+
+        try:
+            # Kill the whole process group to avoid orphaned children
+            os.killpg(os.getpgid(self.ollama_process.pid), signal.SIGTERM)
+            self.ollama_process.wait(timeout=5)
+
+        except Exception:
+            try:
+                self.ollama_process.kill()
+            except Exception:
+                pass
+
+        self.ollama_process = None
+        self.ollama_port = None
+        self.slm_enabled = False
+
+    def slm_generate(self, prompt: str, timeout: int = 60, retries: int = 2) -> str:
+        if not self.slm_enabled or not self.slm_base_url:
+            raise RuntimeError(f"SLM not active for drone {self.agent_id}")
+
+        import time
+        import requests
+
+        url = f"{self.slm_base_url}/api/generate"
+        payload = {
+            "model": self.slm_model,
+            "prompt": prompt,
+            "stream": False,
+        }
+
+        last_error = None
+
+        for attempt in range(retries + 1):
+            try:
+                # Throttle concurrent inference across agents
+                with SLM_SEMAPHORE:
+                    response = requests.post(url, json=payload, timeout=timeout)
+
+                # Explicit handling of backend failures
+                if response.status_code >= 500:
+                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+
+                response.raise_for_status()
+
+                # Parse JSON safely
+                try:
+                    data = response.json()
+                except Exception as e:
+                    raise RuntimeError(f"Invalid JSON from SLM: {response.text[:200]}") from e
+
+                # Validate schema
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"SLM returned non-object JSON: {data}")
+
+                if "response" not in data:
+                    raise RuntimeError(f"Missing 'response' key in SLM output: {data}")
+
+                text = data["response"]
+
+                if text is None:
+                    raise RuntimeError(f"SLM returned null response field: {data}")
+
+                if not isinstance(text, str):
+                    raise RuntimeError(f"SLM response not string: {type(text)}")
+
+                text = text.strip()
+
+                if not text:
+                    raise RuntimeError("SLM returned empty response string")
+
+                return text
+
+            except Exception as e:
+                last_error = e
+
+                if attempt < retries:
+                    backoff = 0.5 * (attempt + 1)
+                    print(
+                        f"[SLM][{self.agent_id}] attempt {attempt + 1} failed: {e}. "
+                        f"Retrying in {backoff:.1f}s"
+                    )
+                    time.sleep(backoff)
+                else:
+                    raise RuntimeError(
+                        f"[SLM FAILURE][{self.agent_id}] after {retries + 1} attempts: {last_error}"
+                    )
 
 
 class DeliveryStation:
@@ -964,11 +1120,6 @@ class Terrain:
             self.command_center.draw(surf)
 
 
-class WorldView:
-    def snapshot(self) -> dict:
-        raise NotImplementedError
-
-
 class CommandCenter:
     """
     Non-mobile coordination artifact.
@@ -984,9 +1135,10 @@ class CommandCenter:
             col: int,
             row: int,
             grid_size: int,
+            physics,
             network_capacity: float = 100.0,
             network_range: int = 12,
-            image_path: str = "assets/command_center.png",
+            image_path: str = "assets/command_center.png"
     ):
         self.col = int(col)
         self.row = int(row)
@@ -1001,10 +1153,11 @@ class CommandCenter:
         self.network_range = int(network_range)
         self.terrain = None
         self.agents = {}  # agent_id -> Drone
+        self.physics = physics
 
         # Centralized brain lives here
-        from strategies.centralised import CentralisedStrategy
-        self.strategy = CentralisedStrategy()
+        from src.strategies.centralised import CentralisedStrategy
+        self.strategy = CentralisedStrategy(physics=physics)
 
         # ----------------------------
         # Load and scale icon
