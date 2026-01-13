@@ -1,3 +1,4 @@
+# analysis/__init__.py
 """
 SPPDEC Experiment Analysis Framework
 

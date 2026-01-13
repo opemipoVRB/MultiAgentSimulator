@@ -514,25 +514,58 @@ class SPPDECLangGraph:
 
         return state
 
-    @staticmethod
-    def extract_first_json(text: str) -> dict:
+    def extract_first_json(self, text: str) -> dict:
         """
         Extract the first JSON-like object from text, repair common LLM issues,
         and return a validated Python dict.
 
         Raises ValueError only if extraction and repair both fail.
         """
+        import json
+        import re
 
-        start = text.find("{")
+        if not text or not isinstance(text, str):
+            raise ValueError("Input must be a non-empty string")
+
+        raw = text.strip()
+
+        # -------------------------------------------------
+        # 1. Try direct JSON parse
+        # -------------------------------------------------
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return self._validate_payload(obj)
+        except Exception:
+            pass
+
+        # -------------------------------------------------
+        # 2. Handle double-encoded JSON
+        # Example: "\"{...}\""
+        # -------------------------------------------------
+        try:
+            decoded = json.loads(raw)
+            if isinstance(decoded, str):
+                obj = json.loads(decoded)
+                if isinstance(obj, dict):
+                    return self._validate_payload(obj)
+        except Exception:
+            pass
+
+        # -------------------------------------------------
+        # 3. Extract first balanced {...} block
+        # -------------------------------------------------
+        start = raw.find("{")
         if start == -1:
-            raise ValueError("No JSON object found")
+            raise ValueError(f"No JSON object found in:\n{raw[:300]}")
 
         depth = 0
         end = None
-        for i in range(start, len(text)):
-            if text[i] == "{":
+
+        for i in range(start, len(raw)):
+            if raw[i] == "{":
                 depth += 1
-            elif text[i] == "}":
+            elif raw[i] == "}":
                 depth -= 1
                 if depth == 0:
                     end = i + 1
@@ -541,28 +574,54 @@ class SPPDECLangGraph:
         if end is None:
             raise ValueError("Unclosed JSON object")
 
-        raw_json = text[start:end].strip()
+        candidate = raw[start:end].strip()
 
-        if "'" in raw_json and '"' not in raw_json:
-            raw_json = raw_json.replace("'", '"')
+        # -------------------------------------------------
+        # 4. Repair common issues
+        # -------------------------------------------------
 
-        raw_json = re.sub(r",\s*}", "}", raw_json)
-        raw_json = re.sub(r",\s*]", "]", raw_json)
+        # Replace single quotes only if no double quotes exist
+        if "'" in candidate and '"' not in candidate:
+            candidate = candidate.replace("'", '"')
 
+        # Remove trailing commas
+        candidate = re.sub(r",\s*}", "}", candidate)
+        candidate = re.sub(r",\s*]", "]", candidate)
+
+        # Reject obvious template placeholders
+        if "{your answer}" in candidate or "{correct parcel id}" in candidate:
+            raise ValueError(f"Template echoed instead of answer:\n{candidate}")
+
+        # -------------------------------------------------
+        # 5. Parse repaired JSON
+        # -------------------------------------------------
         try:
-            data = json.loads(raw_json)
+            obj = json.loads(candidate)
         except json.JSONDecodeError as e:
             raise ValueError(
-                f"JSON extraction failed after repair. Raw:\n{raw_json}\n\nOriginal:\n{text[:300]}"
+                f"JSON extraction failed.\nCandidate:\n{candidate}\n\nOriginal:\n{raw[:300]}"
             ) from e
 
-        if not isinstance(data, dict):
-            raise ValueError(f"JSON must be an object, got: {type(data)}")
+        if not isinstance(obj, dict):
+            raise ValueError(f"JSON must be an object, got {type(obj)}")
 
+        return self._validate_payload(obj)
+
+    @staticmethod
+    def _validate_payload(data: dict) -> dict:
+        """
+        Enforce schema and apply safe defaults.
+        """
         if "parcel_id" not in data:
             raise ValueError(f"Missing 'parcel_id' in {data}")
 
-        if "confidence" not in data:
+        if data["parcel_id"] in (None, "", "{your answer}", "{correct parcel id}"):
+            raise ValueError(f"Invalid parcel_id value: {data['parcel_id']}")
+
+        try:
+            conf = float(data.get("confidence", 0.5))
+            data["confidence"] = max(0.0, min(1.0, conf))
+        except Exception:
             data["confidence"] = 0.5
 
         return data
@@ -574,6 +633,11 @@ class SPPDECLangGraph:
 
         Peer energy beliefs are already integrated into peer costs upstream.
         The SLM sees only adjusted team_efficiency scores and remains unchanged.
+
+        Robustness addition:
+        - Retries SLM call if JSON is invalid
+        - Does NOT change prompt semantics
+        - Falls back to abstain instead of crashing
         """
 
         if state.get("decision_mode") == "idle":
@@ -615,7 +679,6 @@ class SPPDECLangGraph:
             })
 
         task_scores.sort(key=lambda x: x["team_efficiency"], reverse=True)
-
         valid_ids = [t["parcel_id"] for t in task_scores]
 
         print("\n" + "=" * 80)
@@ -643,110 +706,129 @@ class SPPDECLangGraph:
 
         prompt = f"""You are a delivery drone selecting a parcel to pick up.
 
-CRITICAL RULE: Always pick the parcel with the HIGHEST team_efficiency value.
+        ONLY OUTPUT JSON. NO OTHER TEXT.
+        CRITICAL RULE: Always pick the parcel with the HIGHEST team_efficiency value.
 
-Examples to learn from:
+        Examples to learn from:
 
-Example 1:
-Parcels: [{{\"id\": \"A\", \"team_eff\": 5.2}}, {{\"id\": \"B\", \"team_eff\": -1.0}}]
-Correct choice: \"A\" (because 5.2 > -1.0, higher is better)
+        Example 1:
+        Parcels: [{{\"id\": \"A\", \"team_eff\": 5.2}}, {{\"id\": \"B\", \"team_eff\": -1.0}}]
+        Correct choice: \"A\" (because 5.2 > -1.0, higher is better)
 
-Example 2:
-Parcels: [{{\"id\": \"X\", \"team_eff\": -0.5}}, {{\"id\": \"Y\", \"team_eff\": -3.0}}]
-Correct choice: \"X\" (because -0.5 > -3.0, less negative is better)
+        Example 2:
+        Parcels: [{{\"id\": \"X\", \"team_eff\": -0.5}}, {{\"id\": \"Y\", \"team_eff\": -3.0}}]
+        Correct choice: \"X\" (because -0.5 > -3.0, less negative is better)
 
-Example 3:
-Parcels: [{{\"id\": \"P1\", \"team_eff\": 2.0}}, {{\"id\": \"P2\", \"team_eff\": 3.5}}, {{\"id\": \"P3\", \"team_eff\": 1.0}}]
-Correct choice: \"P2\" (because 3.5 is the highest value)
+        Example 3:
+        Parcels: [{{\"id\": \"P1\", \"team_eff\": 2.0}}, {{\"id\": \"P2\", \"team_eff\": 3.5}}, {{\"id\": \"P3\", \"team_eff\": 1.0}}]
+        Correct choice: \"P2\" (because 3.5 is the highest value)
 
-Your available parcels (already sorted highest to lowest):
-{json.dumps([{"parcel_id": t["parcel_id"], "team_efficiency": t["team_efficiency"]} for t in task_scores], indent=2)}
+        Your available parcels (already sorted highest to lowest):
+        {json.dumps([{"parcel_id": t["parcel_id"], "team_efficiency": t["team_efficiency"]} for t in task_scores], indent=2)}
 
-The parcel with HIGHEST team_efficiency is: {task_scores[0]["parcel_id"]} ({task_scores[0]["team_efficiency"]})
+        The parcel with HIGHEST team_efficiency is: {task_scores[0]["parcel_id"]} ({task_scores[0]["team_efficiency"]})
 
-Select this parcel unless you have a strong strategic reason to pick a different one.
+        Select this parcel unless you have a strong strategic reason to pick a different one.
 
-Valid choices: {valid_ids}
+        Valid choices: {valid_ids}
 
-Respond with JSON only (no explanation):
-{{\"parcel_id\": \"<id>\", \"confidence\": <0.0-1.0>}}
-""".strip()
+        Respond with JSON only (no explanation):
+        {{\"parcel_id\": \"<id>\", \"confidence\": <0.0-1.0>}}
+        """.strip()
 
-        try:
-            raw = self.drone.slm_generate(prompt)
-        except Exception as exc:
-            raise RuntimeError(
-                f"[SPPDEC][{agent_id}] SLM invocation failed: {exc}"
-            ) from exc
+        MAX_RETRIES = 2
+        last_error = None
 
-        if not isinstance(raw, str):
-            raise RuntimeError(
-                f"[SPPDEC][{agent_id}] SLM returned non-text response: {type(raw)}"
-            )
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                raw = self.drone.slm_generate(prompt)
 
-        try:
-            result = self.extract_first_json(raw)
-        except Exception as exc:
-            raise RuntimeError(
-                f"[SPPDEC][{agent_id}] SLM returned invalid JSON: {raw[:200]}"
-            ) from exc
+                if not isinstance(raw, str):
+                    raise RuntimeError(
+                        f"[SPPDEC][{agent_id}] SLM returned non-text response: {type(raw)}"
+                    )
 
-        chosen = result.get("parcel_id")
-        conf = result.get("confidence", 0.5)
+                result = self.extract_first_json(raw)
 
-        if chosen not in valid_ids:
-            raise RuntimeError(
-                f"[SPPDEC][{agent_id}] Invalid parcel_id from SLM\n"
-                f"Chosen: {chosen}\n"
-                f"Allowed: {valid_ids}\n"
-                f"Raw output: {raw[:200]}"
-            )
+                chosen = result.get("parcel_id")
+                conf = result.get("confidence", 0.5)
 
-        try:
-            conf = float(conf)
-        except (TypeError, ValueError):
-            conf = 0.5
+                if chosen not in valid_ids:
+                    raise RuntimeError(
+                        f"[SPPDEC][{agent_id}] Invalid parcel_id from SLM\n"
+                        f"Chosen: {chosen}\n"
+                        f"Allowed: {valid_ids}\n"
+                        f"Raw output: {raw[:200]}"
+                    )
 
-        conf = max(0.0, min(1.0, conf))
+                try:
+                    conf = float(conf)
+                except (TypeError, ValueError):
+                    conf = 0.5
 
-        state["slm_preferred_parcel_id"] = chosen
-        state["slm_confidence"] = conf
-        state["slm_status"] = "success"
+                conf = max(0.0, min(1.0, conf))
 
-        selected_efficiency = next(
-            t["team_efficiency"] for t in task_scores if t["parcel_id"] == chosen
-        )
+                state["slm_preferred_parcel_id"] = chosen
+                state["slm_confidence"] = conf
+                state["slm_status"] = "success"
 
-        selected_rank = next(
-            i for i, t in enumerate(task_scores) if t["parcel_id"] == chosen
-        ) + 1
+                selected_efficiency = next(
+                    t["team_efficiency"] for t in task_scores if t["parcel_id"] == chosen
+                )
 
-        is_optimal = chosen == task_scores[0]["parcel_id"]
+                selected_rank = next(
+                    i for i, t in enumerate(task_scores) if t["parcel_id"] == chosen
+                ) + 1
 
-        print("\n" + "=" * 80)
-        print(f"[SPPDEC SLM DECISION] Agent: {agent_id}")
-        print("=" * 80)
-        print(f"Selected Parcel: {chosen}")
-        print(f"Team Efficiency: {selected_efficiency}")
-        print(f"Confidence: {conf:.2f}")
-        print(f"Rank: {selected_rank}/{len(task_scores)}")
-        print(
-            f"Optimal Choice: {'YES' if is_optimal else 'NO (greedy would pick ' + task_scores[0]['parcel_id'] + ')'}"
-        )
-        print(f"Raw SLM Output: {raw[:150]}{'...' if len(raw) > 150 else ''}")
-        print("=" * 80 + "\n")
+                is_optimal = chosen == task_scores[0]["parcel_id"]
 
-        logger.info(
-            "[SPPDEC][%s] SLM selected parcel=%s (team_efficiency=%.1f, confidence=%.2f, rank=%d/%d, optimal=%s)",
+                print("\n" + "=" * 80)
+                print(f"[SPPDEC SLM DECISION] Agent: {agent_id}")
+                print("=" * 80)
+                print(f"Selected Parcel: {chosen}")
+                print(f"Team Efficiency: {selected_efficiency}")
+                print(f"Confidence: {conf:.2f}")
+                print(f"Rank: {selected_rank}/{len(task_scores)}")
+                print(
+                    f"Optimal Choice: {'YES' if is_optimal else 'NO (greedy would pick ' + task_scores[0]['parcel_id'] + ')'}"
+                )
+                print("Raw SLM Output:")
+                print(raw[:1000])  # show up to 1000 chars instead of 150
+                if len(raw) > 1000:
+                    print("... (truncated)")
+                print("=" * 80 + "\n")
+
+                logger.info(
+                    "[SPPDEC][%s] SLM selected parcel=%s (team_efficiency=%.1f, confidence=%.2f, rank=%d/%d, optimal=%s)",
+                    agent_id,
+                    chosen,
+                    selected_efficiency,
+                    conf,
+                    selected_rank,
+                    len(task_scores),
+                    is_optimal,
+                )
+
+                return state
+
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "[SPPDEC][%s] SLM attempt %d failed: %s",
+                    agent_id,
+                    attempt + 1,
+                    str(exc),
+                )
+
+        logger.error(
+            "[SPPDEC][%s] SLM failed after retries. Falling back to abstain. Last error: %s",
             agent_id,
-            chosen,
-            selected_efficiency,
-            conf,
-            selected_rank,
-            len(task_scores),
-            is_optimal,
+            last_error,
         )
 
+        state["slm_status"] = "abstain"
+        state["slm_preferred_parcel_id"] = None
+        state["slm_confidence"] = 0.0
         return state
 
     def decide_mode(self, state: SPPDECAgentState) -> SPPDECAgentState:
