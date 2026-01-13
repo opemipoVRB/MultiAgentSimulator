@@ -5,9 +5,12 @@
 
 ## TL;DR
 
-This repository contains an applied research simulation framework for studying how Small Language Models (SLMs) and episodic Large Language Models (LLMs) can be used as coordination, negotiation, and arbitration primitives in decentralised multi-robot systems operating under intermittent connectivity, limited bandwidth, and finite energy.
+This repository contains an applied research simulation framework for studying how Small Language Models (SLMs) and episodic Large Language Models (LLMs) can function as coordination, negotiation, and arbitration primitives in decentralized multi-robot systems operating under intermittent connectivity, limited bandwidth, and finite energy constraints.
 
-The goal is to empirically evaluate whether language-mediated orchestration improves coordination stability, convergence, and energy efficiency compared to classical decentralised and centralised baselines.
+The core hypothesis is that language-mediated belief modeling can improve coordination quality. In Phase 1, agents use SLM-based reasoning to form predictive beliefs about other agents, tasks, and environment dynamics. These internal models guide local decision-making even when communication is unavailable. In Phase 2, communication is selectively used to update and correct those beliefs when prediction diverges from reality. This creates a feedback loop where reasoning supports anticipation and communication supports correction.
+
+The goal is to empirically evaluate whether this belief-driven orchestration paradigm improves coordination stability, convergence behavior, safety, and energy efficiency when compared to classical decentralized and centralized baselines.
+
 ## Overview
 This repository provides a **PyGame-based simulation environment** designed to explore the intersection of **Agentic AI** and **multi-robot swarm coordination** under realistic resource limitations.  
 Each drone (agent) operates within a grid world, tasked with locating, picking up, and delivering parcels — all while managing internal resources such as **power** and **network connectivity**.
