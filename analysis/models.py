@@ -1,3 +1,4 @@
+# analysis/models.py
 """
 Object-oriented data models for SPPDEC experiment artifacts.
 
@@ -82,7 +83,7 @@ class Station:
 class StrategyMetrics:
     """Performance metrics for a single strategy run."""
     run_id: str
-    strategy_name: str
+    # strategy_name: str
     seed: int
     planner: str
     n_drones: int

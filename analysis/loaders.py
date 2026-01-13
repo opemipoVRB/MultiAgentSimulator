@@ -1,3 +1,4 @@
+# analysis/loaders.py
 """
 Loaders for converting JSON artifacts into structured Python objects.
 """

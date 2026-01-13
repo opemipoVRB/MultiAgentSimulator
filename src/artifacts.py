@@ -163,7 +163,7 @@ class Drone:
         # -------------------------
         # Onboard SLM (optional but embodied)
         # -------------------------
-        self.slm_host = "127.0.0.1"  # always defined
+        self.slm_host = "localhost"  # always defined
         self.ollama_port = None  # assigned when simulation boots
         self.slm_base_url = None  # derived once port is known
         self.slm_model = OLLAMA_MODEL
@@ -803,64 +803,63 @@ class Drone:
         import time
         import requests
 
-        url = f"{self.slm_base_url}/api/generate"
+        base = self.slm_base_url.rstrip("/")
+        if base.endswith("/api/generate"):
+            url = base
+        else:
+            url = f"{base}/api/generate"
+
+        print(f"[DEBUG] URL = {url}")
+
         payload = {
             "model": self.slm_model,
             "prompt": prompt,
-            "stream": False,
+            "stream": False,  # CRITICAL
+            "options": {
+                "temperature": 0.0,
+                "top_p": 0.1,
+            },
+        }
+
+        headers = {
+            "Content-Type": "application/json"
         }
 
         last_error = None
 
         for attempt in range(retries + 1):
             try:
-                # Throttle concurrent inference across agents
                 with SLM_SEMAPHORE:
-                    response = requests.post(url, json=payload, timeout=timeout)
+                    response = requests.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=timeout,
+                    )
 
-                # Explicit handling of backend failures
-                if response.status_code >= 500:
+                if response.status_code != 200:
                     raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
 
-                response.raise_for_status()
-
-                # Parse JSON safely
                 try:
                     data = response.json()
-                except Exception as e:
-                    raise RuntimeError(f"Invalid JSON from SLM: {response.text[:200]}") from e
-
-                # Validate schema
-                if not isinstance(data, dict):
-                    raise RuntimeError(f"SLM returned non-object JSON: {data}")
+                except Exception:
+                    raise RuntimeError(f"Invalid JSON: {response.text[:200]}")
 
                 if "response" not in data:
-                    raise RuntimeError(f"Missing 'response' key in SLM output: {data}")
+                    raise RuntimeError(f"Missing 'response' key: {data}")
 
                 text = data["response"]
 
-                if text is None:
-                    raise RuntimeError(f"SLM returned null response field: {data}")
+                if not isinstance(text, str) or not text.strip():
+                    raise RuntimeError(f"Bad response: {text}")
 
-                if not isinstance(text, str):
-                    raise RuntimeError(f"SLM response not string: {type(text)}")
-
-                text = text.strip()
-
-                if not text:
-                    raise RuntimeError("SLM returned empty response string")
-
-                return text
+                return text.strip()
 
             except Exception as e:
                 last_error = e
-
                 if attempt < retries:
                     backoff = 0.5 * (attempt + 1)
-                    print(
-                        f"[SLM][{self.agent_id}] attempt {attempt + 1} failed: {e}. "
-                        f"Retrying in {backoff:.1f}s"
-                    )
+                    print(f"[SLM][{self.agent_id}] attempt {attempt + 1} failed: {e}. Retrying in {backoff:.1f}s")
                     time.sleep(backoff)
                 else:
                     raise RuntimeError(
