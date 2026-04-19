@@ -10,4 +10,4 @@ OLLAMA_MODELS_DIR = os.getenv(
     os.path.expanduser("~/.ollama/models")
 )
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
-OLLAMA_MODE = os.getenv("OLLAMA_MODE", "external")  # external | embedded
+OLLAMA_MODE = os.getenv("OLLAMA_MODE", "embedded")  # external | embedded

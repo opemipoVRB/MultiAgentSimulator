@@ -7,7 +7,7 @@ convenient access methods and computed properties.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 
 # ============================================================================
@@ -42,6 +42,7 @@ class Agent:
     planner: str
     start_col: int
     start_row: int
+    personality: Optional[str] = None  # Add this line
 
     @property
     def start_position(self) -> Tuple[int, int]:
@@ -265,11 +266,18 @@ class ParcelLifecycle:
 
 @dataclass
 class FleetEvent:
-    """Unsafe event like collision."""
-    type: str  # "collision"
-    cell: Tuple[int, int]
-    agents: List[str]
-    time: TimeStamp
+    """Fleet event with flexible structure to handle different event types."""
+    type: str
+    time: Optional[TimeStamp] = None
+    # Optional fields that may or may not be present
+    cell: Optional[Tuple[int, int]] = None
+    agents: List[str] = field(default_factory=list)
+    step: Optional[int] = None
+    agent_modes: Optional[Dict[str, str]] = None
+    remaining_parcels: Optional[int] = None
+    decision: Optional[str] = None
+    # Store any additional data as metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_collision(self) -> bool:
@@ -279,9 +287,7 @@ class FleetEvent:
     @property
     def n_agents_involved(self) -> int:
         """Number of agents involved in event."""
-        return len(self.agents)
-
-
+        return len(self.agents) if self.agents else 0
 @dataclass
 class TrajectoryPoint:
     """Single point in an agent's trajectory."""
@@ -418,6 +424,8 @@ class StrategyRun:
     heatmap: Heatmap
     fleet: FleetData
     meta: Dict
+    personality_map: Optional[Dict[str, str]] = None        # NEW: Individual agent personalities
+    personality_distribution: Optional[Dict[str, int]] = None  # NEW: Aggregated personality counts
 
     @property
     def run_id(self) -> str:

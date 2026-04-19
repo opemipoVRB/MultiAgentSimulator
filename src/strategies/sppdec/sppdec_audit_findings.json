@@ -1,0 +1,156 @@
+{
+  "summary": {
+    "total_decision_steps": 5,
+    "cheating_percentages": {
+      "knows_parcel_status": 100.0,
+      "knows_all_positions": 100.0,
+      "exceeds_realistic_perception": 100.0,
+      "any_cheating": 100.0
+    },
+    "conclusion": "DEFINITE CHEATING: SPPDEC has global information access"
+  },
+  "detailed": {
+    "first_step": {
+      "step": 0,
+      "agent_id": "drone_0",
+      "agent_position": [
+        10,
+        10
+      ],
+      "num_parcels_accessed": 24,
+      "num_agents_accessed": 3,
+      "real_time_knowledge": {
+        "knows_parcel_status": true,
+        "knows_all_positions": true,
+        "exceeds_realistic_perception": true
+      },
+      "sample_parcel": {
+        "id": "parcel_0",
+        "picked": false,
+        "delivered": false
+      },
+      "sample_agent": {
+        "id": "drone_1",
+        "position": [
+          17,
+          17
+        ]
+      },
+      "timestamp": 0.0
+    },
+    "last_step": {
+      "step": 40,
+      "agent_id": "drone_0",
+      "agent_position": [
+        14,
+        10
+      ],
+      "num_parcels_accessed": 24,
+      "num_agents_accessed": 3,
+      "real_time_knowledge": {
+        "knows_parcel_status": true,
+        "knows_all_positions": true,
+        "exceeds_realistic_perception": true
+      },
+      "sample_parcel": {
+        "id": "parcel_0",
+        "picked": true,
+        "delivered": true
+      },
+      "sample_agent": {
+        "id": "drone_1",
+        "position": [
+          19,
+          17
+        ]
+      },
+      "timestamp": 4.0
+    },
+    "sample_entries": [
+      {
+        "step": 0,
+        "agent_id": "drone_0",
+        "agent_position": [
+          10,
+          10
+        ],
+        "num_parcels_accessed": 24,
+        "num_agents_accessed": 3,
+        "real_time_knowledge": {
+          "knows_parcel_status": true,
+          "knows_all_positions": true,
+          "exceeds_realistic_perception": true
+        },
+        "sample_parcel": {
+          "id": "parcel_0",
+          "picked": false,
+          "delivered": false
+        },
+        "sample_agent": {
+          "id": "drone_1",
+          "position": [
+            17,
+            17
+          ]
+        },
+        "timestamp": 0.0
+      },
+      {
+        "step": 10,
+        "agent_id": "drone_0",
+        "agent_position": [
+          11,
+          10
+        ],
+        "num_parcels_accessed": 24,
+        "num_agents_accessed": 3,
+        "real_time_knowledge": {
+          "knows_parcel_status": true,
+          "knows_all_positions": true,
+          "exceeds_realistic_perception": true
+        },
+        "sample_parcel": {
+          "id": "parcel_0",
+          "picked": true,
+          "delivered": true
+        },
+        "sample_agent": {
+          "id": "drone_1",
+          "position": [
+            17,
+            17
+          ]
+        },
+        "timestamp": 1.0
+      },
+      {
+        "step": 20,
+        "agent_id": "drone_0",
+        "agent_position": [
+          12,
+          10
+        ],
+        "num_parcels_accessed": 24,
+        "num_agents_accessed": 3,
+        "real_time_knowledge": {
+          "knows_parcel_status": true,
+          "knows_all_positions": true,
+          "exceeds_realistic_perception": true
+        },
+        "sample_parcel": {
+          "id": "parcel_0",
+          "picked": true,
+          "delivered": true
+        },
+        "sample_agent": {
+          "id": "drone_1",
+          "position": [
+            18,
+            17
+          ]
+        },
+        "timestamp": 2.0
+      }
+    ]
+  }
+}

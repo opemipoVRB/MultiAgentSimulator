@@ -246,10 +246,10 @@ class StatisticalAnalyzer:
         }
 
     def plot_boxplot(
-        self,
-        metric: str,
-        title: Optional[str] = None,
-        save_path: Optional[Path] = None
+            self,
+            metric: str,
+            title: Optional[str] = None,
+            save_path: Optional[Path] = None
     ):
         """
         Create box plot comparing strategies.
@@ -265,8 +265,10 @@ class StatisticalAnalyzer:
             data=self.df,
             x='strategy_name',
             y=metric,
+            hue='strategy_name',
             ax=ax,
-            palette='Set3'
+            palette='Set3',
+            legend=False
         )
 
         sns.stripplot(
@@ -286,10 +288,12 @@ class StatisticalAnalyzer:
             title = f"Distribution of {metric.replace('_', ' ').title()}"
         ax.set_title(title, fontsize=14, fontweight='bold')
 
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        # Correct way to rotate labels without triggering matplotlib warning
+        plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+
         ax.grid(True, alpha=0.3, axis='y')
 
-        plt.tight_layout()
+        fig.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -342,7 +346,7 @@ class StatisticalAnalyzer:
         )
         ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
+        fig.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')

@@ -66,7 +66,7 @@ class TrajectoryVisualizer:
             save_path: Optional path to save figure
             show_grid: Whether to show grid lines
         """
-        fig, ax = plt.subplots(figsize=self.figsize)
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
 
         # Draw station
         self._draw_station(ax, station)
@@ -90,8 +90,6 @@ class TrajectoryVisualizer:
 
         ax.invert_yaxis()  # Match grid coordinates
         ax.set_aspect('equal')
-
-        plt.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -241,7 +239,7 @@ class HeatmapVisualizer:
             save_path: Optional path to save figure
             cmap: Colormap name
         """
-        fig, ax = plt.subplots(figsize=self.figsize)
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
 
         # Convert heatmap to grid
         grid = strategy_run.heatmap.to_grid(grid_size[0], grid_size[1])
@@ -274,8 +272,6 @@ class HeatmapVisualizer:
             fontsize=10
         )
 
-        plt.tight_layout()
-
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Saved heatmap: {save_path}")
@@ -299,7 +295,14 @@ class HeatmapVisualizer:
             save_dir: Optional directory to save figure
         """
         n_strategies = len(strategy_names)
-        fig, axes = plt.subplots(1, n_strategies, figsize=(8 * n_strategies, 6))
+
+        # Use constrained_layout instead of tight_layout
+        fig, axes = plt.subplots(
+            1,
+            n_strategies,
+            figsize=(8 * n_strategies, 6),
+            constrained_layout=True
+        )
 
         if n_strategies == 1:
             axes = [axes]
@@ -319,23 +322,31 @@ class HeatmapVisualizer:
         # Plot each heatmap
         for ax, strategy_name, grid in zip(axes, strategy_names, grids):
             if grid is None:
-                ax.text(0.5, 0.5, f"Strategy '{strategy_name}' not found",
-                        ha='center', va='center', transform=ax.transAxes)
+                ax.text(
+                    0.5, 0.5,
+                    f"Strategy '{strategy_name}' not found",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes
+                )
                 continue
 
-            im = ax.imshow(grid, cmap='hot', interpolation='nearest',
-                           vmin=0, vmax=global_max, aspect='auto')
+            im = ax.imshow(
+                grid,
+                cmap='hot',
+                interpolation='nearest',
+                vmin=0,
+                vmax=global_max,
+                aspect='auto'
+            )
 
             ax.set_xlabel("Column")
             ax.set_ylabel("Row")
             ax.set_title(strategy_name, fontsize=12, fontweight='bold')
 
-            # Add colorbar to last subplot
-            if ax == axes[-1]:
-                cbar = plt.colorbar(im, ax=axes, fraction=0.046, pad=0.04)
-                cbar.set_label('Visits', rotation=270, labelpad=20)
-
-        plt.tight_layout()
+        # Single shared colorbar across all axes
+        cbar = fig.colorbar(im, ax=axes, fraction=0.046, pad=0.04)
+        cbar.set_label('Visits', rotation=270, labelpad=20)
 
         if save_dir:
             save_dir = Path(save_dir)
@@ -379,7 +390,7 @@ class CollisionVisualizer:
             title: Plot title
             save_path: Optional path to save figure
         """
-        fig, ax = plt.subplots(figsize=self.figsize)
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
 
         # Count collisions per cell
         collision_grid = np.zeros(grid_size[::-1])  # (height, width)
@@ -412,8 +423,6 @@ class CollisionVisualizer:
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
                 fontsize=10
             )
-
-        plt.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -566,7 +575,7 @@ class MetricsVisualizer:
             y_metric: Metric for y-axis
             save_path: Optional path to save figure
         """
-        fig, ax = plt.subplots(figsize=self.figsize)
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
 
         strategy_names = [s.strategy_name for s in experiment.strategies]
         x_values = [getattr(s.metrics, x_metric) for s in experiment.strategies]
@@ -596,10 +605,262 @@ class MetricsVisualizer:
         )
         ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
-
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Saved Pareto plot: {save_path}")
+
+        plt.show()
+
+    def plot_metric_distribution(
+            self,
+            df,
+            metric: str,
+            group_col: str = "strategy_full_name",
+            save_path: Optional[Path] = None,
+    ):
+        """
+        Boxplot showing distribution of a metric across multiple runs.
+        """
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
+
+        sns.boxplot(
+            data=df,
+            x=group_col,
+            y=metric,
+            ax=ax
+        )
+
+        sns.stripplot(
+            data=df,
+            x=group_col,
+            y=metric,
+            ax=ax,
+            color="black",
+            alpha=0.4,
+            size=3
+        )
+
+        ax.set_xlabel("Strategy")
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_title(f"Distribution of {metric.replace('_', ' ').title()}")
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+        plt.show()
+
+    def plot_pareto_runs(
+            self,
+            df,
+            x_metric: str,
+            y_metric: str,
+            group_col: str = "strategy_full_name",
+            save_path: Optional[Path] = None,
+    ):
+        """
+        Scatter plot showing tradeoff across all runs.
+        """
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
+
+        sns.scatterplot(
+            data=df,
+            x=x_metric,
+            y=y_metric,
+            hue=group_col,
+            alpha=0.7,
+            s=60,
+            ax=ax
+        )
+
+        ax.set_xlabel(x_metric.replace("_", " ").title())
+        ax.set_ylabel(y_metric.replace("_", " ").title())
+        ax.set_title("Tradeoff Across Runs")
+        ax.grid(True, alpha=0.3)
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+        plt.show()
+
+    def plot_rank_distribution(
+            self,
+            df,
+            metric: str,
+            group_col: str = "strategy_full_name",
+    ):
+        """
+        Ranks strategies per run and shows rank distribution.
+        """
+        ranked = (
+            df
+                .groupby("run_id")
+                .apply(lambda g: g.assign(rank=g[metric].rank()))
+                .reset_index(drop=True)
+        )
+
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
+
+        sns.boxplot(
+            data=ranked,
+            x=group_col,
+            y="rank",
+            ax=ax
+        )
+
+        ax.invert_yaxis()
+        ax.set_ylabel("Rank (lower is better)")
+        ax.set_xlabel("Strategy")
+        ax.set_title(f"Rank distribution based on {metric.replace('_', ' ')}")
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+        plt.show()
+
+    def plot_mean_ci(
+        self,
+        df,
+        metric: str,
+        group_col: str = "strategy_full_name",
+        save_path: Optional[Path] = None,
+    ):
+        grouped = df.groupby(group_col)[metric]
+        mean = grouped.mean()
+        std = grouped.std()
+        n = grouped.count()
+
+        ci = 1.96 * std / np.sqrt(n)
+
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
+
+        ax.bar(mean.index, mean.values, yerr=ci.values, capsize=5)
+
+        ax.set_xlabel("Strategy")
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_title(f"Mean ± 95% CI: {metric.replace('_', ' ').title()}")
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+        ax.grid(True, alpha=0.3, axis="y")
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+        plt.show()
+
+
+# ============================================================================
+# Scaling Visualization
+# ============================================================================
+
+class ScalingVisualizer:
+    """
+    Visualizes performance scaling across number of agents and tasks.
+    Operates on aggregated dataframe (ExperimentAggregator.dataframe).
+    """
+
+    def __init__(self, figsize: Tuple[int, int] = (10, 6)):
+        self.figsize = figsize
+
+    def plot_scaling(
+        self,
+        df,
+        metric: str,
+        x_axis: str = "n_drones",   # or "n_parcels"
+        group_col: str = "strategy_full_name",
+        ci: float = 0.95,
+        save_path: Optional[Path] = None,
+    ):
+        """
+        Plot scaling curves with confidence intervals.
+
+        Args:
+            df: Aggregated dataframe
+            metric: Metric column name
+            x_axis: 'n_drones' or 'n_parcels'
+            group_col: Strategy grouping column
+            ci: Confidence interval level (0.95 default)
+            save_path: Optional save location
+        """
+
+        assert x_axis in df.columns, f"{x_axis} not in dataframe"
+        assert metric in df.columns, f"{metric} not in dataframe"
+        assert group_col in df.columns, f"{group_col} not in dataframe"
+
+        # Aggregate
+        grouped = (
+            df
+            .groupby([group_col, x_axis])[metric]
+            .agg(["mean", "std", "count"])
+            .reset_index()
+        )
+
+        # Compute confidence interval
+        z = 1.96 if ci == 0.95 else 1.0
+        grouped["ci"] = z * grouped["std"] / np.sqrt(grouped["count"])
+
+        # Plot
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
+
+        for name, g in grouped.groupby(group_col):
+            ax.plot(g[x_axis], g["mean"], marker="o", label=name)
+            ax.fill_between(
+                g[x_axis],
+                g["mean"] - g["ci"],
+                g["mean"] + g["ci"],
+                alpha=0.15,
+            )
+
+        ax.set_xlabel(x_axis.replace("_", " ").title())
+        ax.set_ylabel(metric.replace("_", " ").title())
+        ax.set_title(f"Scaling Analysis: {metric.replace('_', ' ').title()}")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            print(f"✓ Saved scaling plot: {save_path}")
+
+        plt.show()
+
+    def plot_surface(
+        self,
+        df,
+        metric: str,
+        group: str,
+        save_path: Optional[Path] = None,
+    ):
+        """
+        Heatmap of performance across agents × parcels for one strategy.
+        """
+        subset = df[df["strategy_full_name"] == group]
+
+        if subset.empty:
+            raise ValueError(f"No data found for strategy {group}")
+
+        pivot = subset.pivot_table(
+            index="n_drones",
+            columns="n_parcels",
+            values=metric,
+            aggfunc="mean"
+        )
+
+        fig, ax = plt.subplots(figsize=self.figsize, constrained_layout=True)
+
+        im = ax.imshow(pivot.values, aspect="auto", origin="lower")
+
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns)
+
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+
+        ax.set_xlabel("Number of Parcels")
+        ax.set_ylabel("Number of Agents")
+        ax.set_title(f"{group} | {metric.replace('_', ' ').title()}")
+
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label(metric.replace("_", " ").title())
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
 
         plt.show()

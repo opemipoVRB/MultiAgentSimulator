@@ -214,3 +214,13 @@ COMPARE.md
 EVALUATION.md
 PLAN.md
 profile_results.prof
+
+
+
+*.csv
+*.png
+*.pdf
+analysis/notebooks/figures/
+analysis/results/
+report/*.png
+report/*.csv
