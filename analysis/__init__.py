@@ -20,16 +20,19 @@ from .models import (
     Agent,
 )
 
-from .loaders import (
+from .batch_loaders import (
     ExperimentLoader,
     BatchLoader,
 )
+
+from .single_loader import SingleExperimentLoader
 
 from .visualizers import (
     TrajectoryVisualizer,
     HeatmapVisualizer,
     CollisionVisualizer,
     MetricsVisualizer,
+    ScalingVisualizer,
 )
 
 from .aggregators import (
@@ -37,7 +40,26 @@ from .aggregators import (
     StatisticalAnalyzer,
 )
 
-__version__ = "1.0.0"
+from .sweep_analyzer import (
+    SweepAnalyzer,
+    load_sweep,
+    quick_summary,
+)
+
+from .notebook_utils import (
+    NotebookAnalyzer,
+    analyze_sweep,
+    quick_sppdec_comparison,
+)
+
+from .hybrid_metrics import (
+    HybridRecord,
+    HybridLogLoader,
+    HybridMetricsAnalyzer,
+)
+
+
+__version__ = "1.2.0"
 __all__ = [
     # Models
     "Experiment",
@@ -54,12 +76,26 @@ __all__ = [
     # Loaders
     "ExperimentLoader",
     "BatchLoader",
+    "SingleExperimentLoader",
     # Visualizers
     "TrajectoryVisualizer",
     "HeatmapVisualizer",
     "CollisionVisualizer",
     "MetricsVisualizer",
+    "ScalingVisualizer",
     # Aggregators
     "ExperimentAggregator",
     "StatisticalAnalyzer",
+    # Sweep Analysis
+    "SweepAnalyzer",
+    "load_sweep",
+    "quick_summary",
+    # Notebook Utils
+    "NotebookAnalyzer",
+    "analyze_sweep",
+    "quick_sppdec_comparison",
+    # Phase 10: Hybrid Metrics (NEW)
+    "HybridRecord",
+    "HybridLogLoader",
+    "HybridMetricsAnalyzer",
 ]

@@ -18,5 +18,6 @@ CONFIG_REGISTRY = {
 
 def get_sppdec_config(variant: str) -> SPPDECConfig:
     if variant not in CONFIG_REGISTRY:
-        raise ValueError(f"Unknown SPPDEC variant: {variant}")
+        # Fallback default. Personality will override per-agent later.
+        return CONFIG_REGISTRY["combined"]
     return CONFIG_REGISTRY[variant]

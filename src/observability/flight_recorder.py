@@ -1,7 +1,93 @@
-# src/flight_recorder.py
+# src/observability/flight_recorder.py
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import time
+
+# metric headers kept for reference; results are stored in JSON
+METRIC_HEADERS = [
+    "run_id",
+    "planner",
+    "seed",
+    "n_drones",
+    "n_parcels",
+    "comm_reliability",
+    "battery_capacity",
+    "episodic_interval",
+    "total_energy_consumed",
+    "total_distance_traveled",
+    "tasks_completed",
+    "mission_makespan_steps",
+    "unsafe_failures",
+    "messages_sent",
+    "runtime_seconds",
+    "timestamp",
+]
+
+
+class MetricsAccumulator:
+    def __init__(self, run_id: str, planner: str, seed: int, n_drones: int, n_parcels: int,
+                 comm_reliability: float = 1.0, battery_capacity: float = 100.0,
+                 episodic_interval: float = 1.0):
+        self.fields: Dict[str, Any] = {h: 0.0 for h in METRIC_HEADERS}
+        self.fields["run_id"] = run_id
+        self.fields["planner"] = planner
+        self.fields["seed"] = int(seed)
+        self.fields["n_drones"] = int(n_drones)
+        self.fields["n_parcels"] = int(n_parcels)
+        self.fields["comm_reliability"] = float(comm_reliability)
+        self.fields["battery_capacity"] = float(battery_capacity)
+        self.fields["episodic_interval"] = float(episodic_interval)
+        self.fields["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+        self.total_energy_consumed = 0.0
+        self.total_distance_traveled = 0.0
+        self.tasks_completed = 0
+        self.mission_makespan_steps = 0
+        self.unsafe_failures = 0
+        self.messages_sent = 0
+
+        self.start_time = time.time()
+
+    def record_distance(self, pixels: float, grid_size: int):
+        cells = float(pixels) / float(grid_size)
+        self.total_distance_traveled += cells
+
+    def record_task_complete(self, n: int = 1):
+        self.tasks_completed += int(n)
+
+    def record_unsafe_failure(self, n: int = 1):
+        self.unsafe_failures += int(n)
+
+    def record_messages_sent(self, n: int = 1):
+        self.messages_sent += int(n)
+
+    def finalize(self, steps: int, battery_capacity: float, battery_level: float):
+        self.mission_makespan_steps = int(steps)
+        self.total_energy_consumed = max(0.0, battery_capacity - battery_level)
+
+        self.fields["total_energy_consumed"] = round(self.total_energy_consumed, 3)
+        self.fields["total_distance_traveled"] = round(self.total_distance_traveled, 3)
+        self.fields["tasks_completed"] = int(self.tasks_completed)
+        self.fields["mission_makespan_steps"] = int(self.mission_makespan_steps)
+        self.fields["unsafe_failures"] = int(self.unsafe_failures)
+        self.fields["messages_sent"] = int(self.messages_sent)
+
+        runtime = time.time() - self.start_time
+        self.fields["runtime_seconds"] = round(runtime, 3)
+        self.fields["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    def as_dict(self):
+        # convenience for storing in JSON results
+        self.fields["total_energy_consumed"] = round(self.total_energy_consumed, 3)
+        self.fields["total_distance_traveled"] = round(self.total_distance_traveled, 3)
+        self.fields["tasks_completed"] = int(self.tasks_completed)
+        self.fields["mission_makespan_steps"] = int(self.mission_makespan_steps)
+        self.fields["unsafe_failures"] = int(self.unsafe_failures)
+        self.fields["messages_sent"] = int(self.messages_sent)
+        runtime = time.time() - self.start_time
+        self.fields["runtime_seconds"] = round(runtime, 3)
+        self.fields["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        return dict(self.fields)
 
 
 class FlightRecorder:
@@ -72,6 +158,7 @@ class FlightRecorder:
             grid_size: int,
             dt: float = 1.0,
             sim_dt: Optional[float] = None,
+            metrics: Optional[MetricsAccumulator] = None
     ):
         """
                 Initialize a FlightRecorder instance for a single experiment run.
@@ -112,6 +199,15 @@ class FlightRecorder:
         self.dt = sim_dt if sim_dt is not None else dt
         self.started_at = time.time()
         self.strategy_name = strategy_name
+        if metrics is None:
+            raise ValueError("FlightRecorder requires a MetricsAccumulator")
+        self.metrics = metrics
+
+        # ==================================================
+        # Abort events
+        # ==================================================
+        self.abort_events: List[Dict] = []
+        self.correction_events: List[Dict] = []
 
         # ==================================================
         # Agent registry
@@ -167,6 +263,58 @@ class FlightRecorder:
         self._parcel_targets: Dict[str, set] = defaultdict(set)
         self._parcel_chase_start: Dict[str, Dict[str, int]] = defaultdict(dict)
         self._cell_visits = defaultdict(int)
+
+    def record_message_sent(self, n: int = 1):
+        if self.metrics:
+            self.metrics.record_messages_sent(n)
+
+    def record_abort(
+            self,
+            *,
+            reason: str,
+            step: int,
+            sim_time: float,
+            agent_id: Optional[str] = None,
+            metadata: Optional[Dict] = None,
+    ):
+        """
+        Record an abort event as part of simulation observability.
+
+        This captures why a strategy or agent terminated execution
+        and makes aborts analyzable alongside trajectories and metrics.
+        """
+        event = {
+            "type": "abort",
+            "reason": str(reason),
+            "agent_id": agent_id,
+            "time": {
+                "step": step,
+                "sim_time": sim_time,
+                "world_time": time.time(),
+            },
+            "metadata": metadata or {},
+        }
+
+        self.abort_events.append(event)
+
+        print(
+            f"[FLIGHT-RECORDER][ABORT] "
+            f"reason={reason} "
+            f"agent={agent_id} "
+            f"step={step}"
+        )
+
+    def record_distance(self, pixels: float, grid_size: int):
+        if self.metrics:
+            self.metrics.record_distance(pixels, grid_size)
+
+    def record_task_complete(self, n: int = 1):
+        if self.metrics:
+            self.metrics.record_task_complete(n)
+
+    def record_unsafe_failure(self, n: int = 1):
+        if self.metrics:
+            self.metrics.record_unsafe_failure(n)
 
     def reconstruct_from_snapshot(self, snapshot: Dict):
         """
@@ -536,7 +684,13 @@ class FlightRecorder:
             "agents": list(self.agents.values()),
             "parcels": list(self.parcels.values()),
             "fleet_events": self.fleet_events,
+            "abort_events": self.abort_events,
             "heatmap": self.export_heatmap(),
+            "hybrid_log": {
+                aid: data.get("hybrid_log", [])
+                for aid, data in self.agents.items()
+            },
+            "corrections": self.correction_events,
         }
 
         return self._json_safe(raw)
@@ -650,6 +804,110 @@ class FlightRecorder:
 
         self._detect_collisions(step, sim_time, cell_occupancy)
 
+    def tick_hybrid(
+            self,
+            observer_id: str,
+            step: int,
+            sim_time: float,
+            peer_beliefs: Dict,
+            actual_peer_energies: Optional[Dict[str, float]] = None,  # peer_id → actual battery level
+    ):
+        """
+        Record hybrid observability state for all known peers — one entry per
+        peer per timestep.
+
+        For each peer in peer_beliefs this logs:
+          Predicted state  — predicted_position, predicted_energy, confidence
+          Visibility state — is_visible, time_since_last_seen
+          Derived metric   — position_error (distance from predicted to actual;
+                             0.0 when peer is visible and prediction was snapped)
+
+        Call this from perceive() AFTER belief updates are complete so both
+        the visible-snap and invisible-extrapolation paths have already run.
+        """
+        now = time.time()
+        entry_list = self.agents[observer_id].setdefault("hybrid_log", [])
+
+        for peer_id, belief in peer_beliefs.items():
+            pred_pos = belief.get("predicted_position")
+            actual_pos = belief.get("last_pos")  # last *observed* position
+
+            # position_error is meaningful only when the peer was NOT visible;
+            # when visible the prediction was already snapped to actual so error = 0
+            if pred_pos and actual_pos and not belief.get("is_visible", True):
+                from math import dist as _dist
+                pos_error = _dist(pred_pos, actual_pos)
+            else:
+                pos_error = 0.0
+
+            # energy error — only meaningful when peer was visible this cycle
+            # (actual energy is only observable when peer is within sensing radius)
+            actual_energy = (actual_peer_energies or {}).get(peer_id)
+            if actual_energy is not None:
+                energy_error = round(abs(belief.get("predicted_energy", 0.0) - actual_energy), 4)
+            else:
+                energy_error = None  # not observable this cycle — peer is invisible
+
+            entry_list.append({
+                "step": step,
+                "sim_time": sim_time,
+                "world_time": now,
+                "peer_id": peer_id,
+                # predicted state
+                "predicted_position": list(pred_pos) if pred_pos else None,
+                "predicted_energy": belief.get("predicted_energy", 0.0),
+                "confidence": belief.get("confidence", 1.0),
+                "energy_error": energy_error,  # ← add this
+                # visibility state
+                "is_visible": belief.get("is_visible", False),
+                "time_since_last_seen": belief.get("time_since_last_seen", 0),
+                # derived metric
+                "position_error": round(pos_error, 4),
+            })
+
+    def record_correction(
+            self,
+            observer_id: str,
+            peer_id: str,
+            predicted_pos: Tuple,
+            actual_pos: Tuple,
+            error_dist: float,
+            steps_since_seen: int,
+            step: int,
+            sim_time: float,
+    ):
+        """
+        Record a belief correction event — triggered when a peer reappears after
+        being invisible and the predicted position is snapped to the observed one.
+
+        This is the ground truth for prediction quality: how far did we drift
+        in `steps_since_seen` steps?
+
+        Stored in self.correction_events (list) and also appended to the
+        observer agent's per-agent record so per-agent analysis is easy.
+        """
+        event = {
+            "type": "belief_correction",
+            "observer_id": observer_id,
+            "peer_id": peer_id,
+            "time": {
+                "step": step,
+                "sim_time": sim_time,
+                "world_time": time.time(),
+            },
+            "predicted_position": list(predicted_pos),
+            "actual_position": list(actual_pos),
+            "error_dist": round(error_dist, 4),
+            "steps_since_seen": steps_since_seen,
+        }
+
+        # top-level list for fleet-wide analysis
+        self.correction_events.append(event)
+
+        # also index per-agent for easy per-agent retrieval
+        if observer_id in self.agents:
+            self.agents[observer_id].setdefault("correction_events", []).append(event)
+
     def record_initial_plan(
             self,
             agent_id: str,
@@ -743,3 +1001,54 @@ class FlightRecorder:
             "modifier": modifier,
             "note": note,
         })
+
+    def record_slm_decision(
+            self,
+            agent_id: str,
+            step: int,
+            sim_time: float,
+            policy: str,  # "greedy", "hungarian", "greedy_fallback"
+            confidence: float,
+            belief_infeasibility: float,
+            energy_error: float,
+            competition_ratio: float,
+            belief_trend: str,
+            error_trend: str,
+            competition_trend: str,
+            greedy_cost: float,
+            hungarian_cost: Optional[float],  # None if hungarian unavailable
+    ):
+        """
+        Record a single SLM policy selection event with full decision context.
+        Used to characterise when and why Hungarian vs Greedy is selected.
+        """
+        event = {
+            "type": "slm_decision",
+            "agent_id": agent_id,
+            "time": {
+                "step": step,
+                "sim_time": sim_time,
+                "world_time": time.time(),
+            },
+            "policy": policy,
+            "confidence": confidence,
+            "context": {
+                "belief_infeasibility": belief_infeasibility,
+                "energy_error": energy_error,
+                "competition_ratio": competition_ratio,
+                "belief_trend": belief_trend,
+                "error_trend": error_trend,
+                "competition_trend": competition_trend,
+            },
+            "costs": {
+                "greedy": greedy_cost,
+                "hungarian": hungarian_cost,
+                "chosen": greedy_cost if policy in ("greedy", "greedy_fallback") else hungarian_cost,
+            },
+        }
+
+        self.fleet_events.append(event)
+
+        # Also index per-agent for easy retrieval
+        if agent_id in self.agents:
+            self.agents[agent_id].setdefault("slm_decisions", []).append(event)

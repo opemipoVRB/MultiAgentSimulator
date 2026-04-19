@@ -17,17 +17,31 @@ class SPPDECStrategy(BaseStrategy):
     requires_plan_completion_before_requery = False
 
     def __init__(self, physics, variant: str = "combined"):
+        super().__init__()
         self.physics = physics
         self.graph = SPPDECLangGraph(
             physics=self.physics,
             variant=variant
         )
         self._drone = None
+        self.flight_recorder = None
         print("[SPPDEC] Strategy initialized with LangGraph controller")
-        print(f"[SPPDEC] New strategy instance created at {id(self)}")
+        print(f"[SPPDEC] [{variant}] New strategy instance created at {id(self)}")
+        # import traceback
+        #
+        # print("[SPPDEC] Strategy initialized")
+        # traceback.print_stack(limit=5)
+
+    @property
+    def flight_recorder(self):
+        return self.graph.flight_recorder
+
+    @flight_recorder.setter
+    def flight_recorder(self, value):
+        self.graph.flight_recorder = value
 
     def set_drone(self, drone):
-        self._drone = drone
+        self.drone = drone
         self.graph.set_drone(drone)
         print(f"[SPPDEC] set_drone called for {drone.agent_id} on strategy {id(self)}")
 
@@ -43,7 +57,7 @@ class SPPDECStrategy(BaseStrategy):
         agent_id = snapshot.get("agent", {}).get("id", "unknown")
         print(f"[SPPDEC][{agent_id}] Starting decision cycle")
         # Inject drone dynamically from controller
-        if self._drone is None:
+        if self.drone is None:
             raise RuntimeError("[SPPDEC] Drone not injected into strategy")
 
         # Initialize state with snapshot
@@ -67,6 +81,7 @@ class SPPDECStrategy(BaseStrategy):
         final_state = self.graph.app.invoke(state)
         directive = final_state.get("directive")
 
+
         if directive is None:
             print(f"[SPPDEC][{agent_id}] No directive produced → WAIT")
             return {"mode": "wait"}
@@ -80,3 +95,6 @@ class SPPDECStrategy(BaseStrategy):
             print(f"[SPPDEC][{agent_id}] Decision: {mode}")
 
         return directive
+
+
+

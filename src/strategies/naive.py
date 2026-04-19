@@ -65,8 +65,13 @@ class NaiveStrategy(BaseStrategy):
             Number of greedy rollouts to generate per planning cycle.
             Higher values increase exploration of task-battery trade-offs.
         """
+        super().__init__()
         self.num_trials = num_trials
         self.physics = physics
+        self.drone = None
+
+    def set_drone(self, drone):
+        self.drone = drone
 
     # ------------------------------------------------------------------
     # Public API
@@ -90,56 +95,57 @@ class NaiveStrategy(BaseStrategy):
         """
         Produce a single open-loop plan with quantified operational confidence.
 
-        Process:
-        1. Check if any parcels exist at all
-        2. If no parcels, return empty plan (controller will park)
-        3. Generate multiple greedy rollouts with varying efficiency trade-offs
-        4. Compute operational confidence for each rollout using improved robustness model
-        5. Select plan with highest confidence
-        6. Return detailed ranking with comprehensive confidence rationale
+        This method represents the epistemic core of the naive decentralized agent.
+        It answers the question: given the agent's current knowledge and battery,
+        is there a safe and meaningful course of action?
 
-        Key Improvements from Original:
-        - Sublinear risk growth (sqrt) to avoid over-penalizing multi-task plans
-        - Reasonable confidence thresholds that work across battery levels
-        - Clear, complete logging showing all calculations
-        - No dynamic thresholds that break abstraction
+        The method must return one of three outcomes:
+        1) A valid plan with mode implicitly assumed as "plan"
+        2) An idle response when no work exists
+        3) An abort response when the agent determines the mission is infeasible
 
-        Parameters:
-        -----------
+        Abort is not an error. Abort is a rational conclusion that the agent
+        cannot proceed safely or meaningfully under its operational constraints.
+
+        Parameters
+        ----------
         snapshot : Dict[str, Any]
-            World snapshot containing agent state and available parcels.
+            World snapshot containing:
+            - agent state
+            - available parcels
+            - station geometry
 
-        Returns:
-        --------
+        Returns
+        -------
         Dict[str, Any]
-            Plan response containing:
-            - plan: selected sequence of pickup/drop actions (empty if no feasible plans)
-            - confidence: operational robustness score [0, 1]
-            - projected_battery_remaining: estimated battery after execution
-            - ranking: full ranking of all evaluated rollouts
-            - narration: detailed human-readable explanation of selection
+            Either:
+            - A plan response
+            - An idle response
+            - An abort response with mode="abort"
         """
+
         agent_id = snapshot["agent"].get("id", "unknown")
-        current_battery = float(snapshot["agent"]["battery_pct"])
+
+        if self.drone is None:
+            raise RuntimeError("[NAIVE] Drone not injected into strategy")
+
+        current_battery = float(self.drone.power.percent())
         N = self.num_trials
 
         print(f"[NAIVE-PLANNER][agent={agent_id}] Planning with {current_battery:.1f}% battery")
 
-        # -------------------------------------------------
-        # Operational Robustness Parameters
-        # -------------------------------------------------
-        # These are calibrated to produce reasonable confidence values
-        # Risk grows sublinearly (sqrt) to avoid over-penalizing multi-task plans
-        BASE_RISK_DENSITY = 0.02  # Base risk per task (2%)
-        SIGMOID_SHARPNESS = 3.0  # Reasonable transition sharpness
-        SIGMOID_OFFSET = 0.5  # Offset for sigmoid (0.5 means we need less buffer)
-        MIN_CONFIDENCE = 0.2  # Minimum acceptable confidence
-        MIN_SAFE_BATTERY = 10.0  # Absolute minimum battery after execution
+        # -------------------------------
+        # Operational robustness parameters
+        # -------------------------------
+        BASE_RISK_DENSITY = 0.02
+        SIGMOID_SHARPNESS = 3.0
+        SIGMOID_OFFSET = 0.5
+        MIN_SAFE_BATTERY = self.FEASIBILITY_MARGIN
         EPSILON = 1e-3
 
-        # -------------------------------------------------
+        # -------------------------------
         # STEP 1: Check for available parcels
-        # -------------------------------------------------
+        # -------------------------------
         parcels_available = [
             dict(p)
             for p in snapshot.get("all_parcels", [])
@@ -147,29 +153,31 @@ class NaiveStrategy(BaseStrategy):
         ]
 
         if not parcels_available:
-            print(f"[NAIVE-PLANNER][agent={agent_id}] NO PARCELS: No parcels available for delivery.")
-            return self._empty_plan_response(
-                snapshot,
-                "No parcels available for delivery."
-            )
+            print(f"[NAIVE-PLANNER][agent={agent_id}] NO PARCELS: environment is idle")
+            return self._idle_response(snapshot, "No parcels available")
 
-        print(f"[NAIVE-PLANNER][agent={agent_id}] Found {len(parcels_available)} available parcels")
+        print(f"[NAIVE-PLANNER][agent={agent_id}] Found {len(parcels_available)} parcels")
 
-        # -------------------------------------------------
-        # STEP 2: Quick feasibility check
-        # -------------------------------------------------
-        if not self._any_parcel_feasible(snapshot, parcels_available):
-            print(f"[NAIVE-PLANNER][agent={agent_id}] NO FEASIBLE PARCELS: Insufficient battery for any delivery.")
-            return self._empty_plan_response(
-                snapshot,
-                "No feasible parcels (insufficient battery for any delivery)."
-            )
+        # -------------------------------
+        # STEP 2: Feasibility test
+        # -------------------------------
+        # If the agent cannot safely deliver even one parcel, this is not idle.
+        # This is epistemic failure and should terminate the strategy.
+        if not self.is_globally_feasible(snapshot):
+            print(f"[NAIVE-PLANNER][agent={agent_id}] ABORT: no feasible parcel given current battery")
 
-        # -------------------------------------------------
-        # STEP 3: Generate greedy rollouts
-        # -------------------------------------------------
-        print(f"[NAIVE-PLANNER][agent={agent_id}] Generating {N} greedy rollouts...")
+            return {
+                "mode": "abort",
+                "agent_id": agent_id,
+                "reason": "agent_energy_infeasible",
+            }
+
+        # -------------------------------
+        # STEP 3: Generate rollouts
+        # -------------------------------
         rollouts: List[Dict[str, Any]] = []
+
+        print(f"[NAIVE-PLANNER][agent={agent_id}] Generating {N} rollouts")
 
         for i in range(N):
             efficiency_weight = i / max(1, N - 1)
@@ -180,7 +188,6 @@ class NaiveStrategy(BaseStrategy):
                 efficiency_weight=efficiency_weight
             )
 
-            # Only consider non-empty plans
             if plan:
                 rollouts.append({
                     "trial": i + 1,
@@ -191,33 +198,28 @@ class NaiveStrategy(BaseStrategy):
                 })
 
                 print(
-                    f"[NAIVE-PLANNER][agent={agent_id}][trial {i + 1}/{N}] "
-                    f"efficiency_weight={efficiency_weight:.2f} → "
-                    f"tasks={len(plan):2d}, "
-                    f"projected_battery={projected_battery:5.1f}%"
+                    f"[NAIVE-PLANNER][agent={agent_id}][trial {i + 1}] "
+                    f"tasks={len(plan)}, battery={projected_battery:.1f}%"
                 )
             else:
-                print(
-                    f"[NAIVE-PLANNER][agent={agent_id}][trial {i + 1}/{N}] "
-                    f"efficiency_weight={efficiency_weight:.2f} → "
-                    f"NO FEASIBLE PLAN"
-                )
+                print(f"[NAIVE-PLANNER][agent={agent_id}][trial {i + 1}] no feasible plan")
 
-        # -------------------------------------------------
-        # STEP 4: Handle case where all rollouts are empty
-        # -------------------------------------------------
+        # -------------------------------
+        # STEP 4: Abort if exploration fails
+        # -------------------------------
         if not rollouts:
-            print(f"[NAIVE-PLANNER][agent={agent_id}] ALL ROLLOUTS EMPTY: No plans could be generated.")
-            return self._empty_plan_response(
-                snapshot,
-                "No delivery plans could be generated (all rollouts failed)."
-            )
+            print(f"[NAIVE-PLANNER][agent={agent_id}] ABORT: planner explored but found no plans")
 
-        # -------------------------------------------------
+            return {
+                "mode": "abort",
+                "agent_id": agent_id,
+                "reason": "no_feasible_rollout",
+            }
+
+        # -------------------------------
         # STEP 5: Compute confidence for each rollout
-        # -------------------------------------------------
+        # -------------------------------
         max_tasks = max(r["task_completion"] for r in rollouts)
-        print(f"[NAIVE-PLANNER][agent={agent_id}] Maximum tasks among rollouts: {max_tasks}")
 
         for r in rollouts:
             confidence, components = self._compute_operational_confidence_with_components(
@@ -227,122 +229,157 @@ class NaiveStrategy(BaseStrategy):
                 base_risk_density=BASE_RISK_DENSITY,
                 sigmoid_sharpness=SIGMOID_SHARPNESS,
                 sigmoid_offset=SIGMOID_OFFSET,
-                epsilon=EPSILON
+                epsilon=EPSILON,
             )
 
             r["confidence"] = confidence
             r["confidence_components"] = components
 
-        # -------------------------------------------------
-        # STEP 6: Filter and rank plans
-        # -------------------------------------------------
-        # Filter plans that are too risky or have insufficient battery
+        # -------------------------------
+        # STEP 6: Safety filter using prefixes
+        # -------------------------------
         acceptable_plans = []
+
         for r in rollouts:
-            if r["confidence"] >= MIN_CONFIDENCE and r["projected_battery"] >= MIN_SAFE_BATTERY:
-                acceptable_plans.append(r)
-            else:
-                print(
-                    f"[NAIVE-PLANNER][agent={agent_id}] REJECTED PLAN: "
-                    f"tasks={r['task_completion']:2d}, "
-                    f"battery={r['projected_battery']:5.1f}%, "
-                    f"confidence={r['confidence']:.3f} "
-                    f"(min_conf={MIN_CONFIDENCE}, min_battery={MIN_SAFE_BATTERY})"
-                )
+            repaired = self._best_safe_prefix(r, snapshot, MIN_SAFE_BATTERY)
 
+            if repaired is None:
+                print(f"[NAIVE-PLANNER][agent={agent_id}] rollout rejected: no safe prefix")
+                continue
+
+            acceptable_plans.append(repaired)
+
+        # If nothing survives safety filtering, abort
         if not acceptable_plans:
-            print(
-                f"[NAIVE-PLANNER][agent={agent_id}] NO ACCEPTABLE PLANS: All plans rejected by confidence or battery thresholds.")
-            return self._empty_plan_response(
-                snapshot,
-                f"No acceptable plans found (all plans below confidence {MIN_CONFIDENCE} or battery {MIN_SAFE_BATTERY}% threshold)."
-            )
+            print(f"[NAIVE-PLANNER][agent={agent_id}] ABORT: no safe prefix for any plan")
 
-        # Rank by confidence (primary), then tasks, then battery
+            return {
+                "mode": "abort",
+                "agent_id": agent_id,
+                "reason": "no_safe_prefix",
+            }
+
+        # -------------------------------
+        # STEP 7: Rank plans
+        # -------------------------------
         ranked = sorted(
             acceptable_plans,
             key=lambda r: (
-                r["confidence"],  # Highest confidence first
-                r["task_completion"],  # More tasks at same confidence
-                r["projected_battery"],  # More battery at same confidence/tasks
+                r["confidence"],
+                r["task_completion"],
+                r["projected_battery"],
             ),
-            reverse=True
+            reverse=True,
         )
 
-        # Add rank numbers
         for idx, r in enumerate(ranked, start=1):
             r["rank"] = idx
 
-        # -------------------------------------------------
-        # STEP 7: Log detailed ranking
-        # -------------------------------------------------
-        print(f"[NAIVE-PLANNER][agent={agent_id}] FINAL RANKING OF ACCEPTABLE PLANS:")
-        print(
-            f"[NAIVE-PLANNER][agent={agent_id}] {'Rank':<4} {'Tasks':<6} {'Battery':<8} {'Confidence':<10} {'RiskCoverage':<12} {'RobustProb':<10}")
-        print(f"[NAIVE-PLANNER][agent={agent_id}] {'-' * 4} {'-' * 6} {'-' * 8} {'-' * 10} {'-' * 12} {'-' * 10}")
-
-        for r in ranked[:5]:  # Show top 5
-            components = r["confidence_components"]
-            marker = " ← SELECTED" if r["rank"] == 1 else ""
-
-            print(
-                f"[NAIVE-PLANNER][agent={agent_id}] "
-                f"{r['rank']:<4} "
-                f"{r['task_completion']:<6} "
-                f"{r['projected_battery']:<8.1f}% "
-                f"{r['confidence']:<10.3f} "
-                f"{components['risk_coverage']:<12.3f} "
-                f"{components['robustness_prob']:<10.3f}"
-                f"{marker}"
-            )
-
-        # -------------------------------------------------
+        # -------------------------------
         # STEP 8: Select best plan
-        # -------------------------------------------------
+        # -------------------------------
         best = ranked[0]
-        components = best["confidence_components"]
 
-        print(f"[NAIVE-PLANNER][agent={agent_id}] SELECTED BEST PLAN:")
-        print(
-            f"[NAIVE-PLANNER][agent={agent_id}]   Tasks: {best['task_completion']}/{max_tasks} (Mission Value: {components['mission_value']:.3f})")
-        print(
-            f"[NAIVE-PLANNER][agent={agent_id}]   Projected Battery: {best['projected_battery']:.1f}% (Normalized Buffer: {components['battery_buffer']:.3f})")
-        print(
-            f"[NAIVE-PLANNER][agent={agent_id}]   Inherent Risk: {components['inherent_risk']:.3f} (Risk Density: {BASE_RISK_DENSITY:.3f} × sqrt({best['task_completion']}))")
-        print(
-            f"[NAIVE-PLANNER][agent={agent_id}]   Risk Coverage Ratio: {components['risk_coverage']:.3f} (Buffer/Risk)")
-        print(f"[NAIVE-PLANNER][agent={agent_id}]   Robustness Probability: {components['robustness_prob']:.3f}")
-        print(f"[NAIVE-PLANNER][agent={agent_id}]   FINAL CONFIDENCE: {best['confidence']:.3f}")
+        # -------------------------------
+        # STEP 9: Commitment horizon
+        # -------------------------------
+        if best["confidence"] > 0.8:
+            horizon = 3
+        elif best["confidence"] > 0.5:
+            horizon = 2
+        else:
+            horizon = 1
 
-        # -------------------------------------------------
-        # STEP 9: Generate comprehensive narration
-        # -------------------------------------------------
-        narration = self._generate_detailed_narration(best, max_tasks, components)
+        committed_plan = best["plan"][:horizon]
 
-        # -------------------------------------------------
-        # STEP 10: Prepare response
-        # -------------------------------------------------
-        ranking_summary = [
-            {
-                "rank": r["rank"],
-                "task_completion": r["task_completion"],
-                "projected_battery": round(r["projected_battery"], 2),
-                "confidence": round(r["confidence"], 4),
-                "efficiency_weight": r.get("efficiency_weight", 0.0),
-            }
-            for r in ranked
-        ]
+        narration = (
+                self._generate_detailed_narration(
+                    best,
+                    max_tasks,
+                    best["confidence_components"]
+                )
+                + f" Agent commits to next {len(committed_plan)} task(s) before replanning."
+        )
 
+        print(f"[NAIVE-PLANNER][agent={agent_id}][NARRATION] {narration}")
+
+        # -------------------------------
+        # STEP 10: Return valid plan
+        # -------------------------------
         return {
             "agent_id": agent_id,
-            "plan": best["plan"],
+            "plan": committed_plan,
             "confidence": best["confidence"],
             "projected_battery_remaining": best["projected_battery"],
-            "ranking": ranking_summary,
+            "ranking": [
+                {
+                    "rank": r["rank"],
+                    "task_completion": r["task_completion"],
+                    "projected_battery": round(r["projected_battery"], 2),
+                    "confidence": round(r["confidence"], 4),
+                    "efficiency_weight": r.get("efficiency_weight", 0.0),
+                }
+                for r in ranked
+            ],
             "selected_rank": best["rank"],
             "narration": narration,
-            "strategy": "naive-multi-greedy",
+            "strategy": "naive-multi-greedy-receding",
         }
+
+    def _best_safe_prefix(self, rollout, snapshot, min_battery, agent_id=None):
+        """
+        Try longest safe prefix of a rollout plan.
+        Returns modified rollout or None if nothing feasible.
+        """
+        full_plan = rollout["plan"]
+
+        for k in range(len(full_plan), 0, -1):
+            prefix = full_plan[:k]
+
+            battery = float(self.drone.power.percent())
+            cur_pos = (snapshot["agent"]["col"], snapshot["agent"]["row"])
+            station = snapshot.get("nearest_station")
+
+            feasible = True
+
+            for step in prefix:
+                pick = tuple(step["pickup"])
+                drop = tuple(step["dropoff"])
+                weight = step["weight"]
+
+                pickup_cost = self.physics.energy_cost(
+                    distance=self.physics.distance(a=cur_pos, b=pick),
+                    weight=0.0
+                )
+                delivery_cost = self.physics.energy_cost(
+                    distance=self.physics.distance(a=pick, b=drop),
+                    weight=weight
+                )
+
+                battery -= (pickup_cost + delivery_cost)
+                cur_pos = drop
+
+                if battery < min_battery:
+                    feasible = False
+                    break
+
+            if feasible:
+                rollout_copy = dict(rollout)
+                rollout_copy["plan"] = prefix
+                rollout_copy["task_completion"] = len(prefix)
+                rollout_copy["projected_battery"] = battery
+                return rollout_copy
+            else:
+                # 👇 THIS is where rejection belongs
+                if agent_id:
+                    print(
+                        f"[NAIVE-PLANNER][agent={agent_id}] PREFIX REJECTED: "
+                        f"tasks={k:2d}, "
+                        f"battery={battery:5.1f}% "
+                        f"(min_battery={min_battery})"
+                    )
+
+        return None
 
     # ------------------------------------------------------------------
     # Improved Operational Confidence Calculation
@@ -486,87 +523,51 @@ class NaiveStrategy(BaseStrategy):
     # Helper Methods
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _empty_plan_response(snapshot: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    def _empty_plan_response(self, snapshot: Dict[str, Any], reason: str) -> Dict[str, Any]:
         """
-        Create a standardized empty plan response.
+        Backward compatibility wrapper.
+
+        Historically this method was used for both idle and failure states.
+        It is now semantically equivalent to _idle_response and should only
+        be used for benign idle conditions.
+        """
+        return self._idle_response(snapshot, reason)
+
+    def _idle_response(self, snapshot: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        """
+        Construct a standardized IDLE response.
+
+        This represents a benign state where:
+        - No work exists in the environment, OR
+        - The mission is effectively complete, OR
+        - The agent should simply remain parked
+
+        This MUST NOT be used for failure conditions.
+        Failures must return: {"mode": "abort", ...}
 
         Parameters:
         -----------
         snapshot : Dict[str, Any]
             Current world snapshot
         reason : str
-            Detailed human-readable reason for empty plan
+            Human-readable explanation for idling
 
         Returns:
         --------
         Dict[str, Any]
-            Empty plan response
+            Idle response payload
         """
         return {
+            "mode": "idle",
             "agent_id": snapshot["agent"].get("id", "unknown"),
             "plan": [],
             "confidence": 0.0,
-            "projected_battery_remaining": snapshot["agent"]["battery_pct"],
+            "projected_battery_remaining": self.drone.power.percent(),
             "ranking": [],
             "selected_rank": None,
             "narration": reason,
             "strategy": "naive-multi-greedy",
         }
-
-    def _any_parcel_feasible(self, snapshot: Dict[str, Any], parcels: List[Dict[str, Any]]) -> bool:
-        """
-        Quick check if ANY parcel can be delivered with current battery.
-
-        Parameters:
-        -----------
-        snapshot : Dict[str, Any]
-            World snapshot
-        parcels : List[Dict[str, Any]]
-            Available parcels to check
-
-        Returns:
-        --------
-        bool
-            True if at least one parcel is feasible, False otherwise
-        """
-        if not parcels:
-            return False
-
-        agent = snapshot["agent"]
-        current_battery = float(agent["battery_pct"])
-        SAFETY_MARGIN = 3.0
-        NOMINAL_WEIGHT = 1.0
-
-        cur_pos = (agent["col"], agent["row"])
-        station = snapshot.get("nearest_station")
-
-        # Quick drop estimate (station center)
-        def quick_drop(pick_pos):
-            if not station:
-                return pick_pos
-            center_col = station["col"] + station["w"] // 2
-            center_row = station["row"] + station["h"] // 2
-            return (center_col, center_row)
-
-        # Check first few parcels (avoid O(n^2) in planning phase)
-        for p in parcels[:min(10, len(parcels))]:
-            pick_pos = (p["col"], p["row"])
-            drop_pos = quick_drop(pick_pos)
-
-            # Conservative energy estimate
-            pickup_dist = self.physics.distance(a=cur_pos, b=pick_pos)
-            delivery_dist = self.physics.distance(a=pick_pos, b=drop_pos)
-            weight = float(p.get("weight", NOMINAL_WEIGHT))
-
-            pickup_cost = self.physics.energy_cost(distance=pickup_dist, weight=0.0)
-            delivery_cost = self.physics.energy_cost(distance=delivery_dist, weight=weight)
-            total_cost = pickup_cost + delivery_cost
-
-            if current_battery >= total_cost + SAFETY_MARGIN:
-                return True
-
-        return False
 
     @staticmethod
     def _generate_detailed_narration(plan_info: Dict[str, Any],
@@ -699,17 +700,15 @@ class NaiveStrategy(BaseStrategy):
             random.shuffle(parcels)
 
         # Initial state
-        start_battery = float(agent["battery_pct"])
+        start_battery = float(self.drone.power.percent())
         battery = start_battery
         cur_pos = (agent["col"], agent["row"])
         station = snapshot.get("nearest_station")
 
         plan: List[Dict[str, Any]] = []
-        NOMINAL_WEIGHT = 1.0
-        SAFETY_MARGIN = 3.0  # Minimum battery buffer
 
         # Greedy parcel selection loop
-        while parcels and battery > SAFETY_MARGIN:
+        while parcels and battery > self.FEASIBILITY_MARGIN:
             scored_parcels = []
 
             # Score each feasible parcel
@@ -718,7 +717,7 @@ class NaiveStrategy(BaseStrategy):
                 drop_pos = self._choose_drop_cell(pick_pos, station)
 
                 true_weight = float(p.get("weight", 1.0))
-                est_weight = true_weight if known_weight else NOMINAL_WEIGHT
+                est_weight = true_weight if known_weight else self.NOMINAL_WEIGHT
 
                 # Calculate energy costs
                 pickup_dist = self.physics.distance(a=cur_pos, b=pick_pos)
@@ -729,7 +728,7 @@ class NaiveStrategy(BaseStrategy):
                 total_cost = pickup_cost + delivery_cost
 
                 # Feasibility check
-                if battery < total_cost + SAFETY_MARGIN:
+                if battery < total_cost + self.FEASIBILITY_MARGIN:
                     continue  # Insufficient battery
 
                 # Efficiency-weighted scoring
@@ -778,22 +777,37 @@ class NaiveStrategy(BaseStrategy):
             pick: Tuple[int, int],
             station: Optional[Dict[str, Any]],
     ) -> Tuple[int, int]:
-        """Same as original - selects drop cell."""
         if not station:
             return pick
 
-        # Generate all cells within station bounds
-        cells: List[Tuple[int, int]] = [
-            (c, r)
-            for r in range(station["row"], station["row"] + station["h"])
-            for c in range(station["col"], station["col"] + station["w"])
-        ]
+        # We need access to the real terrain object to check occupancy
+        terrain = self.drone.terrain if hasattr(self.drone, "terrain") else None
+        if terrain is None:
+            # fallback to original behavior if terrain not available
+            return (
+                station["col"] + station["w"] // 2,
+                station["row"] + station["h"] // 2,
+            )
 
-        # Compute distance-based weights
-        distances = [self.physics.distance(a=pick, b=cell) for cell in cells]
-        weights = [1.0 / (d + 1.0) for d in distances]
+        # Get actual DeliveryStation object
+        real_station = terrain.get_station_at(station["col"], station["row"])
+        if real_station is None:
+            return pick
 
-        return random.choices(cells, weights=weights, k=1)[0]
+        # Ask the station for free cells based on real occupancy
+        free = real_station.free_cells(terrain)
+
+        # If everything is blocked, fallback to any station cell
+        if not free:
+            free = real_station.parking_cells()
+
+        # Choose nearest free cell to pickup
+        chosen = min(
+            free,
+            key=lambda c: abs(c[0] - pick[0]) + abs(c[1] - pick[1])
+        )
+
+        return chosen
 
     # ------------------------------------------------------------------
     # Reactive fallback logic (unchanged from original)

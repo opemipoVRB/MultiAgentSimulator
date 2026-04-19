@@ -19,6 +19,7 @@ seaborn = "*"
 scipy = "*"
 pandas = "*"
 numpy = "*"
+typing-extensions = "*"
 
 [dev-packages]
 

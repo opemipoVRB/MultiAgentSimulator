@@ -26,6 +26,9 @@ class Grid2DPhysics(PhysicsRules):
       planning-time estimation and execution-time consumption
     """
 
+    def __init__(self):
+        self.current_step = 0
+
     @staticmethod
     def manhattan_distance(
             a: Tuple[int, int],

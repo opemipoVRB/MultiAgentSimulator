@@ -1,4 +1,4 @@
-# analysis/loaders.py
+# analysis/batch_loaders.py
 """
 Loaders for converting JSON artifacts into structured Python objects.
 """
@@ -72,13 +72,42 @@ class FleetLoader:
 
     @staticmethod
     def load_fleet_event(data: Dict[str, Any]) -> FleetEvent:
-        """Parse fleet event from JSON."""
-        return FleetEvent(
-            type=data["type"],
-            cell=tuple(data["cell"]),
-            agents=data["agents"],
-            time=FleetLoader.load_timestamp(data["time"])
-        )
+        """Parse fleet event from JSON with flexible structure."""
+        event = FleetEvent(type=data["type"])
+
+        # Handle timestamp if present
+        if "time" in data:
+            event.time = FleetLoader.load_timestamp(data["time"])
+
+        # Handle cell if present
+        if "cell" in data:
+            event.cell = tuple(data["cell"])
+
+        # Handle agents if present
+        if "agents" in data:
+            event.agents = data["agents"]
+
+        # Handle runner state fields
+        if "step" in data:
+            event.step = data["step"]
+
+        if "agent_modes" in data:
+            event.agent_modes = data["agent_modes"]
+
+        if "remaining_parcels" in data:
+            event.remaining_parcels = data["remaining_parcels"]
+
+        if "decision" in data:
+            event.decision = data["decision"]
+
+        # Store any other fields as metadata
+        known_fields = {
+            'type', 'time', 'cell', 'agents', 'step',
+            'agent_modes', 'remaining_parcels', 'decision'
+        }
+        event.metadata = {k: v for k, v in data.items() if k not in known_fields}
+
+        return event
 
     @staticmethod
     def load(data: Dict[str, Any]) -> Tuple[List[ParcelLifecycle], List[FleetEvent]]:
