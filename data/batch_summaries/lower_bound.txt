@@ -1,0 +1,22 @@
+320 missions -> .ignore/revision/batch_summaries/lower_bound.csv
+281 missions completed by all 8 strategies
+
+last delivery / lower bound: 281 missions
+  cbba_full_capability_bundle                             mean 1.639  (+63.9%)
+  cbba_full_cbba_bundle                                   mean 1.915  (+91.5%)
+  cbba_single_task_cbba_single                            mean 1.489  (+48.9%)
+  centralized_cc_hungarian_hungarian                      mean 1.457  (+45.7%)
+  decentralized_auction_auction_baseline                  mean 2.600  (+160.0%)
+  marl_ippo_limited                                       mean 1.860  (+86.0%)
+  naive_decentralized_reactive                            mean 2.180  (+118.0%)
+  sppdec_consensus_rule_nogamble_limited                  mean 1.381  (+38.1%)
+
+last delivery / exact relaxed optimum (A<=4, P<=12): 35 missions
+  cbba_full_capability_bundle                             mean 1.331  (+33.1%)
+  cbba_full_cbba_bundle                                   mean 1.556  (+55.6%)
+  cbba_single_task_cbba_single                            mean 1.355  (+35.5%)
+  centralized_cc_hungarian_hungarian                      mean 1.346  (+34.6%)
+  decentralized_auction_auction_baseline                  mean 1.420  (+42.0%)
+  marl_ippo_limited                                       mean 1.331  (+33.1%)
+  naive_decentralized_reactive                            mean 1.618  (+61.8%)
+  sppdec_consensus_rule_nogamble_limited                  mean 1.230  (+23.0%)

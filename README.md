@@ -11,6 +11,26 @@ The core hypothesis is that language-mediated belief modeling can improve coordi
 
 The goal is to empirically evaluate whether this belief-driven orchestration paradigm improves coordination stability, convergence behavior, safety, and energy efficiency when compared to classical decentralized and centralized baselines.
 
+## Revised IEEE IoT-J paper: data and reproduction
+
+This release (`v2.0-iotj-r1`) holds the code, data and scripts behind the revised manuscript (IoT-65753-2026). In the revised method SPPDEC uses no language model; the language-model code is kept for the ablation reported in the paper.
+
+- `data/batch_summaries/`: one row per mission for every batch the paper reports (main grid, sensing, radio, batteries, maps, obstacles, late orders, reserve floor, sensitivity, speed transfer, energy by source, language-model re-run), plus the analysis text files.
+- `data/marl/`: the trained MARL policy used in every MARL run (`v3_shape_mb_best.npz`), its training settings and training log.
+- `scripts/paper_runs/`: the shell scripts that ran each batch (`PYTHON` selects the interpreter; default `python3`).
+- `analysis/revision/`: the analysis code.
+
+Regenerate the paper's tables from the saved summaries (needs numpy, pandas, scipy, matplotlib):
+
+```bash
+python -m analysis.revision.paper_tables data/batch_summaries <out dir>
+python -m analysis.revision.gap_paper_tables <out dir>
+```
+
+Re-running a batch from scratch: `bash scripts/paper_runs/<name>.sh` (MARL training also needs PyTorch). The full grid takes many hours on a 32-core machine.
+
+---
+
 ## Overview
 This repository provides a **PyGame-based simulation environment** designed to explore the intersection of **Agentic AI** and **multi-robot swarm coordination** under realistic resource limitations.  
 Each drone (agent) operates within a grid world, tasked with locating, picking up, and delivering parcels — all while managing internal resources such as **power** and **network connectivity**.

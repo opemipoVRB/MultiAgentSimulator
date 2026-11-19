@@ -22,6 +22,7 @@ class Parcel:
     row: int
     picked: bool
     delivered: bool
+    weight: Optional[float] = None  # stored from the revision onwards
 
     @property
     def position(self) -> Tuple[int, int]:

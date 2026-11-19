@@ -1,6 +1,13 @@
 # src/observability/flight_recorder.py
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional, Any
+
+from src import sim_clock
+
+# Peer-belief (hybrid) log sampling interval in steps. The submitted runs logged every
+# step (still the case with SIM_FIXED_TIMESTEP=0); the revision samples every 0.5 s
+# simulated, plus every visibility change.
+HYBRID_LOG_EVERY = 30 if sim_clock.FIXED_TIMESTEP else 1
 import time
 
 # metric headers kept for reference; results are stored in JSON
@@ -263,10 +270,6 @@ class FlightRecorder:
         self._parcel_targets: Dict[str, set] = defaultdict(set)
         self._parcel_chase_start: Dict[str, Dict[str, int]] = defaultdict(dict)
         self._cell_visits = defaultdict(int)
-
-    def record_message_sent(self, n: int = 1):
-        if self.metrics:
-            self.metrics.record_messages_sent(n)
 
     def record_abort(
             self,
@@ -706,24 +709,6 @@ class FlightRecorder:
     # ======================================================
     # Plot-ready helpers
     # ======================================================
-    def get_agent_paths(self):
-        return {
-            aid: [t["cell"] for t in data["trajectory"]]
-            for aid, data in self.agents.items()
-        }
-
-    def get_energy_curves(self):
-        return {
-            aid: [(e["time"]["step"], e["battery_pct"]) for e in data["energy"]]
-            for aid, data in self.agents.items()
-        }
-
-    def get_collision_points(self):
-        return [
-            (e["cell"], e["time"]["step"])
-            for e in self.fleet_events
-            if e["type"] == "collision"
-        ]
 
     def tick_agent(
             self,
@@ -827,8 +812,21 @@ class FlightRecorder:
         """
         now = time.time()
         entry_list = self.agents[observer_id].setdefault("hybrid_log", [])
+        if not hasattr(self, "_hybrid_last_visibility"):
+            self._hybrid_last_visibility = {}  # observer -> peer -> visible (not exported)
+        last_vis = self._hybrid_last_visibility.setdefault(observer_id, {})
+        periodic = step % HYBRID_LOG_EVERY == 0
 
         for peer_id, belief in peer_beliefs.items():
+            # Sample every HYBRID_LOG_EVERY steps, plus every visibility change (the
+            # prediction-quality events). Logging every peer every step grew without
+            # bound: ~0.4 MB per step at 20 agents, tens of GB on long runs.
+            visible = belief.get("is_visible", False)
+            changed = last_vis.get(peer_id) != visible
+            last_vis[peer_id] = visible
+            if not (periodic or changed):
+                continue
+
             pred_pos = belief.get("predicted_position")
             actual_pos = belief.get("last_pos")  # last *observed* position
 
@@ -864,6 +862,44 @@ class FlightRecorder:
                 # derived metric
                 "position_error": round(pos_error, 4),
             })
+
+    def record_latency(self, *, agent_id: str, step: int, latency_steps: int):
+        """Simulated SLM inference time charged to a decision (steps at 60 Hz)."""
+        self.agents[agent_id].setdefault("latency_events", []).append(
+            {"type": "slm_latency", "time": {"step": step}, "latency_steps": int(latency_steps)})
+
+    def record_message(self, *, agent_id: str, step: int, to: str, kind: str, cell):
+        """One radio transmission: who sent it, when, from which cell, to whom ("*" is a broadcast) and what it was about."""
+        self.agents[agent_id].setdefault("message_events", []).append({
+            "type": "message", "time": {"step": step}, "to": str(to), "kind": str(kind),
+            "cell": list(cell) if cell else None})
+
+    def record_plan_outcome(self, *, agent_id: str, step: int, outcome: str, cell, planned_cell, started=None):
+        """What became of a plan at the pickup: picked / pick_failed / target_gone / unplanned_parcel_*. `started` is the step the drone began that leg."""
+        self.agents[agent_id].setdefault("plan_outcomes", []).append({
+            "type": "plan_outcome",
+            "time": {"step": step},
+            "outcome": outcome,
+            "cell": list(cell) if cell else None,
+            "planned_cell": list(planned_cell) if planned_cell else None,
+            "started_step": started,
+        })
+
+    def record_decision_action(self, *, agent_id: str, step: int, sim_time: float, policy, gate,
+                               decided_parcel, decided_cell, directive_mode: str, directive_cell,
+                               reason_not_acted):
+        """A decision and the directive it became; reason_not_acted is None when they agree."""
+        self.agents[agent_id].setdefault("decision_actions", []).append({
+            "type": "decision_action",
+            "time": {"step": step, "sim_time": sim_time},
+            "policy": policy,
+            "gate": gate,
+            "decided_parcel": decided_parcel,
+            "decided_cell": decided_cell,
+            "directive_mode": directive_mode,
+            "directive_cell": directive_cell,
+            "reason_not_acted": reason_not_acted,
+        })
 
     def record_correction(
             self,
@@ -1017,6 +1053,14 @@ class FlightRecorder:
             competition_trend: str,
             greedy_cost: float,
             hungarian_cost: Optional[float],  # None if hungarian unavailable
+            gate: Optional[str] = None,  # which pre-filter gate / rule / "slm" decided
+            arbiter: Optional[str] = None,  # slm | always_greedy | always_hungarian | rule_based
+            prompt_inputs: Optional[Dict] = None,  # exact SLM prompt inputs, for offline replay
+            check: Optional[Dict] = None,  # decision-guard result: violations, warnings, override
+            proposals: Optional[Dict] = None,  # each reasoning model's task for this drone, and agreement
+            status: str = "success",  # success | failed (the model gave no usable answer)
+            failure_reason: Optional[str] = None,
+            attempts: Optional[int] = None,  # generation attempts used, for decisions that consulted the model
     ):
         """
         Record a single SLM policy selection event with full decision context.
@@ -1032,6 +1076,14 @@ class FlightRecorder:
             },
             "policy": policy,
             "confidence": confidence,
+            "gate": gate,
+            "arbiter": arbiter,
+            "prompt_inputs": prompt_inputs,
+            "check": check,
+            "proposals": proposals,
+            "status": status,
+            "failure_reason": failure_reason,
+            "attempts": attempts,
             "context": {
                 "belief_infeasibility": belief_infeasibility,
                 "energy_error": energy_error,

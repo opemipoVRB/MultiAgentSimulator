@@ -1,0 +1,19 @@
+condition when    pairs  whole table  first tasks  own bundles
+exact    later       1         0.0%         0.0%         0.0%
+exact    start     717       100.0%       100.0%       100.0%
+l50      later       4         0.0%         0.0%         0.0%
+l50      start     717       100.0%       100.0%       100.0%
+n1       later      13         0.0%         0.0%         0.0%
+n1       start     717         2.1%         2.2%         9.5%
+n2       later      27         0.0%         0.0%         0.0%
+n2       start     717         0.1%         0.1%         3.5%
+n2l50    later      13         0.0%         0.0%         7.7%
+n2l50    start     717         3.3%         3.6%        13.4%
+
+step 1, ordered pairs (i,j): drone i's expectation of drone j against j's own result
+cond     pairs  first task  whole bundle
+exact     1434      100.0%        100.0%
+l50       1434      100.0%        100.0%
+n1        1434       30.7%         27.0%
+n2        1434       17.7%         15.2%
+n2l50     1434       34.5%         31.3%

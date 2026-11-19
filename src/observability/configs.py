@@ -1,5 +1,6 @@
 # src/observability/configs.py
 
+import os
 import random
 from typing import List, Dict
 
@@ -132,7 +133,7 @@ SCALING_CONFIG = {
 }
 """
 SCALING_CONFIG = {
-    "name": "station_scaling",
+    "name": os.getenv("SWEEP_NAME", "station_scaling"),
     "num_instances": 1,  # 5 seeds per config is statistically solid
     "mode": "research",  # curated coverage
     "budget": 40,  # ignored in research mode
@@ -145,3 +146,23 @@ SCALING_CONFIG = {
     # "sweeps": None,
 }
 
+
+# ---------------------------------
+# Browsing a batch of runs
+# ---------------------------------
+# SWEEP_NAME=revision_fixed_dt/components_final python -m src.run_experiment
+# opens the runner's menus on the runs of that folder under experiments/ (replay any finished run).
+# The configuration list is then the A<agents>_P<parcels> folders found there.
+if os.getenv("SWEEP_NAME"):
+    import re
+    from pathlib import Path
+
+    _root = Path(__file__).resolve().parents[2] / "experiments" / os.getenv("SWEEP_NAME")
+    _found = []
+    if _root.is_dir():
+        for _d in sorted(_root.iterdir()):
+            _m = re.fullmatch(r"A(\d+)_P(\d+)", _d.name)
+            if _m and _d.is_dir():
+                _found.append({"agents": int(_m.group(1)), "parcels": int(_m.group(2))})
+    if _found:
+        SCALING_CONFIG["sweeps"] = sorted(_found, key=lambda c: (c["agents"], c["parcels"]))

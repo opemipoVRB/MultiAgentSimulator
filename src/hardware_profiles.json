@@ -1,0 +1,182 @@
+{
+ "workstation_gpu": {
+  "description": "This machine, language model on the GPU (16 GB).",
+  "models": {
+   "qwen3:0.6b": {
+    "prefill_tps": 37016.7,
+    "decode_tps": 317.9,
+    "cache_ratio": 0.333,
+    "prompt_tokens": 2221
+   },
+   "qwen3:1.7b": {
+    "prefill_tps": 18508.3,
+    "decode_tps": 225.4,
+    "cache_ratio": 0.25,
+    "prompt_tokens": 2221
+   },
+   "qwen3:4b": {
+    "prefill_tps": 7910.7,
+    "decode_tps": 132.0,
+    "cache_ratio": 0.25,
+    "prompt_tokens": 2215
+   },
+   "qwen3:8b": {
+    "prefill_tps": 4828.3,
+    "decode_tps": 87.7,
+    "cache_ratio": 0.239,
+    "prompt_tokens": 2221
+   },
+   "qwen3-vl:8b-instruct": {
+    "prefill_tps": 4810.9,
+    "decode_tps": 82.3,
+    "cache_ratio": 0.217,
+    "prompt_tokens": 2213
+   }
+  }
+ },
+ "workstation_cpu": {
+  "description": "This machine, language model on the CPU only, all threads.",
+  "models": {
+   "qwen3:0.6b": {
+    "prefill_tps": 582.9,
+    "decode_tps": 68.0,
+    "cache_ratio": 0.336,
+    "prompt_tokens": 2221
+   },
+   "qwen3:1.7b": {
+    "prefill_tps": 236.8,
+    "decode_tps": 37.7,
+    "cache_ratio": 0.286,
+    "prompt_tokens": 2221
+   },
+   "qwen3:4b": {
+    "prefill_tps": 93.5,
+    "decode_tps": 18.7,
+    "cache_ratio": 0.284,
+    "prompt_tokens": 2215
+   },
+   "qwen3:8b": {
+    "prefill_tps": 53.1,
+    "decode_tps": 11.4,
+    "cache_ratio": 0.273,
+    "prompt_tokens": 2221
+   },
+   "qwen3-vl:8b-instruct": {
+    "prefill_tps": 53.4,
+    "decode_tps": 11.7,
+    "cache_ratio": 0.27,
+    "prompt_tokens": 2213
+   }
+  }
+ },
+ "cpu_4core": {
+  "description": "This machine, CPU only, limited to 4 threads (an upper bound for a 4-core board).",
+  "models": {
+   "qwen3:0.6b": {
+    "prefill_tps": 355.4,
+    "decode_tps": 40.9,
+    "cache_ratio": 0.349,
+    "prompt_tokens": 2221
+   },
+   "qwen3:1.7b": {
+    "prefill_tps": 149.0,
+    "decode_tps": 24.2,
+    "cache_ratio": 0.289,
+    "prompt_tokens": 2221
+   },
+   "qwen3:4b": {
+    "prefill_tps": 58.1,
+    "decode_tps": 11.4,
+    "cache_ratio": 0.283,
+    "prompt_tokens": 2215
+   },
+   "qwen3:8b": {
+    "prefill_tps": 30.5,
+    "decode_tps": 7.7,
+    "cache_ratio": 0.269,
+    "prompt_tokens": 2221
+   },
+   "qwen3-vl:8b-instruct": {
+    "prefill_tps": 32.6,
+    "decode_tps": 7.7,
+    "cache_ratio": 0.268,
+    "prompt_tokens": 2213
+   }
+  }
+ },
+ "pi5_estimate": {
+  "description": "ESTIMATE, not measured: the 4-thread CPU measurements scaled by 0.41 (published Raspberry Pi 5 decode speed for a 1.5B model, midpoint 10 tokens/s, over 24.2 measured here for qwen3:1.7b on 4 threads); the same factor is applied to reading the prompt.",
+  "models": {
+   "qwen3:0.6b": {
+    "prefill_tps": 146.9,
+    "decode_tps": 16.9,
+    "cache_ratio": 0.349,
+    "prompt_tokens": 2221
+   },
+   "qwen3:1.7b": {
+    "prefill_tps": 61.6,
+    "decode_tps": 10.0,
+    "cache_ratio": 0.289,
+    "prompt_tokens": 2221
+   },
+   "qwen3:4b": {
+    "prefill_tps": 24.0,
+    "decode_tps": 4.7,
+    "cache_ratio": 0.283,
+    "prompt_tokens": 2215
+   },
+   "qwen3:8b": {
+    "prefill_tps": 12.6,
+    "decode_tps": 3.2,
+    "cache_ratio": 0.269,
+    "prompt_tokens": 2221
+   },
+   "qwen3-vl:8b-instruct": {
+    "prefill_tps": 13.5,
+    "decode_tps": 3.2,
+    "cache_ratio": 0.268,
+    "prompt_tokens": 2213
+   }
+  }
+ },
+ "jetson_orin_nano_8gb": {
+  "description": "A drone's own Jetson Orin Nano 8 GB (dedicated, no queue behind other drones). Published llama.cpp speeds (Q4_K_M, 25 W mode) for qwen3 1.7B, 4B and 8B; the other models scaled as stated per model. https://turingpi.com/jetson-orin-nano-8gb-llm-benchmark/",
+  "models": {
+   "qwen3:1.7b": {
+    "prefill_tps": 1408.3,
+    "decode_tps": 39.42,
+    "cache_ratio": 0.25,
+    "prompt_tokens": 2221,
+    "source": "published"
+   },
+   "qwen3:4b": {
+    "prefill_tps": 609.7,
+    "decode_tps": 19.53,
+    "cache_ratio": 0.25,
+    "prompt_tokens": 2215,
+    "source": "published"
+   },
+   "qwen3:8b": {
+    "prefill_tps": 355.5,
+    "decode_tps": 12.64,
+    "cache_ratio": 0.239,
+    "prompt_tokens": 2221,
+    "source": "published"
+   },
+   "qwen3:0.6b": {
+    "prefill_tps": 2816.6,
+    "decode_tps": 55.6,
+    "cache_ratio": 0.333,
+    "prompt_tokens": 2221,
+    "source": "ESTIMATE: qwen3:1.7b published speed times the speed ratio on this machine's GPU"
+   },
+   "qwen3-vl:8b-instruct": {
+    "prefill_tps": 354.2,
+    "decode_tps": 11.9,
+    "cache_ratio": 0.217,
+    "prompt_tokens": 2213,
+    "source": "ESTIMATE: qwen3:8b published speed times the speed ratio on this machine's GPU"
+   }
+  }
+ }
+}

@@ -1,0 +1,154 @@
+{
+ "rate": {
+  "models": {
+   "greedy": {
+    "runs": 12,
+    "delivered_share": 0.921,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 1.33,
+    "mean_energy": 663.2,
+    "mission_end_vs_best": 1.221
+   },
+   "hungarian": {
+    "runs": 12,
+    "delivered_share": 0.954,
+    "all_delivered_runs": 0.75,
+    "drones_lost_per_run": 0.92,
+    "mean_energy": 622.6,
+    "mission_end_vs_best": 1.0
+   },
+   "cbba_direct": {
+    "runs": 12,
+    "delivered_share": 0.95,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 1.08,
+    "mean_energy": 613.5,
+    "mission_end_vs_best": 1.032
+   },
+   "cbba_rounds": {
+    "runs": 12,
+    "delivered_share": 0.942,
+    "all_delivered_runs": 0.417,
+    "drones_lost_per_run": 1.0,
+    "mean_energy": 622.6,
+    "mission_end_vs_best": 1.111
+   }
+  },
+  "runs_where_all_models_finished": 5,
+  "runs": 12
+ },
+ "weight": {
+  "models": {
+   "greedy": {
+    "runs": 12,
+    "delivered_share": 0.896,
+    "all_delivered_runs": 0.583,
+    "drones_lost_per_run": 2.08,
+    "mean_energy": 688.0,
+    "mission_end_vs_best": 1.198
+   },
+   "hungarian": {
+    "runs": 12,
+    "delivered_share": 0.925,
+    "all_delivered_runs": 0.5,
+    "drones_lost_per_run": 1.83,
+    "mean_energy": 663.3,
+    "mission_end_vs_best": 1.002
+   },
+   "cbba_direct": {
+    "runs": 12,
+    "delivered_share": 0.929,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 1.67,
+    "mean_energy": 653.2,
+    "mission_end_vs_best": 1.0
+   },
+   "cbba_rounds": {
+    "runs": 12,
+    "delivered_share": 0.929,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 0.92,
+    "mean_energy": 669.5,
+    "mission_end_vs_best": 1.074
+   }
+  },
+  "runs_where_all_models_finished": 6,
+  "runs": 12
+ },
+ "mixed": {
+  "models": {
+   "greedy": {
+    "runs": 12,
+    "delivered_share": 0.988,
+    "all_delivered_runs": 0.75,
+    "drones_lost_per_run": 0.75,
+    "mean_energy": 567.4,
+    "mission_end_vs_best": 1.313
+   },
+   "hungarian": {
+    "runs": 12,
+    "delivered_share": 0.975,
+    "all_delivered_runs": 0.583,
+    "drones_lost_per_run": 0.75,
+    "mean_energy": 542.7,
+    "mission_end_vs_best": 1.034
+   },
+   "cbba_direct": {
+    "runs": 12,
+    "delivered_share": 0.983,
+    "all_delivered_runs": 0.75,
+    "drones_lost_per_run": 0.67,
+    "mean_energy": 530.9,
+    "mission_end_vs_best": 1.0
+   },
+   "cbba_rounds": {
+    "runs": 12,
+    "delivered_share": 0.979,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 0.92,
+    "mean_energy": 534.4,
+    "mission_end_vs_best": 1.093
+   }
+  },
+  "runs_where_all_models_finished": 4,
+  "runs": 12
+ },
+ "shift": {
+  "models": {
+   "greedy": {
+    "runs": 12,
+    "delivered_share": 0.892,
+    "all_delivered_runs": 0.5,
+    "drones_lost_per_run": 1.92,
+    "mean_energy": 569.1,
+    "mission_end_vs_best": 1.203
+   },
+   "hungarian": {
+    "runs": 12,
+    "delivered_share": 0.938,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 1.58,
+    "mean_energy": 533.5,
+    "mission_end_vs_best": 1.003
+   },
+   "cbba_direct": {
+    "runs": 12,
+    "delivered_share": 0.938,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 1.58,
+    "mean_energy": 516.6,
+    "mission_end_vs_best": 1.0
+   },
+   "cbba_rounds": {
+    "runs": 12,
+    "delivered_share": 0.938,
+    "all_delivered_runs": 0.667,
+    "drones_lost_per_run": 1.58,
+    "mean_energy": 522.4,
+    "mission_end_vs_best": 1.137
+   }
+  },
+  "runs_where_all_models_finished": 6,
+  "runs": 12
+ }
+}

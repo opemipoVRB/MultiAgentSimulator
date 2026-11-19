@@ -457,6 +457,14 @@ class SLMDecisionAnalyzer:
                 # Outcome
                 "policy":               policy,
                 "confidence":           e.get("confidence", np.nan),
+                # How the decision was reached (absent in runs exported before the revision)
+                "gate":                 e.get("gate"),
+                "arbiter":              e.get("arbiter"),
+                "status":               e.get("status", "success"),
+                "failure_reason":       e.get("failure_reason"),
+                "attempts":             e.get("attempts", np.nan),
+                "overridden_to":        (e.get("check") or {}).get("overridden_to"),
+                "rule_policy":          (e.get("check") or {}).get("expected_policy"),
                 # Context signals
                 "belief_infeasibility": context.get("belief_infeasibility", np.nan),
                 "energy_error":         context.get("energy_error",         np.nan),
