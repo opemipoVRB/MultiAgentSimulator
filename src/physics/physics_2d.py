@@ -28,6 +28,8 @@ class Grid2DPhysics(PhysicsRules):
 
     def __init__(self):
         self.current_step = 0
+        from src import sim_clock
+        self.steps_per_cell = sim_clock.STEPS_PER_CELL        # steps to fly one cell, from the simulator's own speed
 
     @staticmethod
     def manhattan_distance(
@@ -61,11 +63,14 @@ class Grid2DPhysics(PhysicsRules):
             b: Tuple[int, int],
     ) -> float:
         """
-        Alias for Manhattan distance.
-
-        Provided to satisfy the PhysicsRules interface.
+        Travel distance in cells: the straight-line distance a drone really flies (it moves along a line and its energy is charged on the distance covered).
+        Every cost and energy estimate uses this, so planning matches consumption. The grid (Manhattan) distance stays available as `manhattan_distance`
+        and is what the sensing radius is defined on.
         """
-        return float(self.manhattan_distance(a, b))
+        from src import obstacles
+        if obstacles.active():
+            return float(obstacles.distance(a, b))        # map with no-fly blocks: the length of the route actually flown
+        return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
 
     def movement_cost(
             self,
@@ -99,6 +104,14 @@ class Grid2DPhysics(PhysicsRules):
                 * Drone.BASE_COST_PER_CELL
                 * (1.0 + payload_weight * Drone.WEIGHT_FACTOR)
         )
+
+    def travel_steps(self, distance: float) -> float:
+        """Steps a drone needs to fly `distance` cells (the simulator's speed; the same for every strategy)."""
+        return float(distance) * self.steps_per_cell
+
+    def pick_drop_cost(self, weight: float) -> float:
+        """Energy of one pick or one drop of a parcel of this weight (mirrors the Drone's energy model)."""
+        return Drone.PICK_DROP_COST * (1.0 + weight * Drone.WEIGHT_FACTOR)
 
     def energy_cost(
             self,

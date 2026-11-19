@@ -71,7 +71,10 @@ class NaiveStrategy(BaseStrategy):
         self.drone = None
 
     def set_drone(self, drone):
-        self.drone = drone
+        super().set_drone(drone)
+        # Per-drone generator, seeded from the run and the drone, so rollouts do not share a generator and the
+        # same run gives the same result whatever the thread timing or process layout.
+        self._rng = random.Random(f"naive-{self.drone.agent_id}-{self.drone.run_seed}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -336,7 +339,7 @@ class NaiveStrategy(BaseStrategy):
         for k in range(len(full_plan), 0, -1):
             prefix = full_plan[:k]
 
-            battery = float(self.drone.power.percent())
+            battery = float(self.drone.power.level)   # energy units
             cur_pos = (snapshot["agent"]["col"], snapshot["agent"]["row"])
             station = snapshot.get("nearest_station")
 
@@ -347,16 +350,7 @@ class NaiveStrategy(BaseStrategy):
                 drop = tuple(step["dropoff"])
                 weight = step["weight"]
 
-                pickup_cost = self.physics.energy_cost(
-                    distance=self.physics.distance(a=cur_pos, b=pick),
-                    weight=0.0
-                )
-                delivery_cost = self.physics.energy_cost(
-                    distance=self.physics.distance(a=pick, b=drop),
-                    weight=weight
-                )
-
-                battery -= (pickup_cost + delivery_cost)
+                battery -= self.trip_energy(cur_pos, pick, drop, weight)
                 cur_pos = drop
 
                 if battery < min_battery:
@@ -367,7 +361,7 @@ class NaiveStrategy(BaseStrategy):
                 rollout_copy = dict(rollout)
                 rollout_copy["plan"] = prefix
                 rollout_copy["task_completion"] = len(prefix)
-                rollout_copy["projected_battery"] = battery
+                rollout_copy["projected_battery"] = battery / float(self.drone.power.capacity) * 100.0
                 return rollout_copy
             else:
                 # 👇 THIS is where rejection belongs
@@ -375,7 +369,7 @@ class NaiveStrategy(BaseStrategy):
                     print(
                         f"[NAIVE-PLANNER][agent={agent_id}] PREFIX REJECTED: "
                         f"tasks={k:2d}, "
-                        f"battery={battery:5.1f}% "
+                        f"battery={battery:5.1f} units "
                         f"(min_battery={min_battery})"
                     )
 
@@ -481,57 +475,10 @@ class NaiveStrategy(BaseStrategy):
         return confidence, components
 
     # Backward compatibility wrapper
-    def _compute_operational_confidence(self,
-                                        task_completion: int,
-                                        battery_percent: float,
-                                        max_tasks: int,
-                                        risk_density: float = 0.02,
-                                        sigmoid_sharpness: float = 3.0,
-                                        epsilon: float = 1e-3) -> float:
-        """Legacy wrapper for backward compatibility."""
-        confidence, _ = self._compute_operational_confidence_with_components(
-            task_completion=task_completion,
-            battery_percent=battery_percent,
-            max_tasks=max_tasks,
-            base_risk_density=risk_density,
-            sigmoid_sharpness=sigmoid_sharpness,
-            sigmoid_offset=0.5,
-            epsilon=epsilon
-        )
-        return confidence
-
-    def _get_confidence_components(self,
-                                   task_completion: int,
-                                   battery_percent: float,
-                                   max_tasks: int,
-                                   risk_density: float = 0.02,
-                                   sigmoid_sharpness: float = 3.0,
-                                   epsilon: float = 1e-3) -> Dict[str, float]:
-        """Legacy wrapper for backward compatibility."""
-        _, components = self._compute_operational_confidence_with_components(
-            task_completion=task_completion,
-            battery_percent=battery_percent,
-            max_tasks=max_tasks,
-            base_risk_density=risk_density,
-            sigmoid_sharpness=sigmoid_sharpness,
-            sigmoid_offset=0.5,
-            epsilon=epsilon
-        )
-        return components
 
     # ------------------------------------------------------------------
     # Helper Methods
     # ------------------------------------------------------------------
-
-    def _empty_plan_response(self, snapshot: Dict[str, Any], reason: str) -> Dict[str, Any]:
-        """
-        Backward compatibility wrapper.
-
-        Historically this method was used for both idle and failure states.
-        It is now semantically equivalent to _idle_response and should only
-        be used for benign idle conditions.
-        """
-        return self._idle_response(snapshot, reason)
 
     def _idle_response(self, snapshot: Dict[str, Any], reason: str) -> Dict[str, Any]:
         """
@@ -697,10 +644,10 @@ class NaiveStrategy(BaseStrategy):
         ]
 
         if shuffle:
-            random.shuffle(parcels)
+            getattr(self, "_rng", random).shuffle(parcels)
 
         # Initial state
-        start_battery = float(self.drone.power.percent())
+        start_battery = float(self.drone.power.level)   # energy units
         battery = start_battery
         cur_pos = (agent["col"], agent["row"])
         station = snapshot.get("nearest_station")
@@ -719,13 +666,8 @@ class NaiveStrategy(BaseStrategy):
                 true_weight = float(p.get("weight", 1.0))
                 est_weight = true_weight if known_weight else self.NOMINAL_WEIGHT
 
-                # Calculate energy costs
-                pickup_dist = self.physics.distance(a=cur_pos, b=pick_pos)
-                delivery_dist = self.physics.distance(a=pick_pos, b=drop_pos)
-
-                pickup_cost = self.physics.energy_cost(distance=pickup_dist, weight=0.0)
-                delivery_cost = self.physics.energy_cost(distance=delivery_dist, weight=est_weight)
-                total_cost = pickup_cost + delivery_cost
+                # The energy of the whole trip (pickup leg, delivery leg, pick and drop)
+                total_cost = self.trip_energy(cur_pos, pick_pos, drop_pos, est_weight)
 
                 # Feasibility check
                 if battery < total_cost + self.FEASIBILITY_MARGIN:
@@ -734,7 +676,7 @@ class NaiveStrategy(BaseStrategy):
                 # Efficiency-weighted scoring
                 # Higher score = more desirable parcel
                 task_value = 1.0  # Each parcel contributes 1 task
-                efficiency = 1.0 / max(0.1, total_cost)  # Avoid division by zero
+                efficiency = 1.0 / max(0.1, total_cost + self.time_weight * self.trip_time(cur_pos, pick_pos, drop_pos))  # Avoid division by zero
 
                 # Combined score: weighted average of task value and efficiency
                 score = (efficiency_weight * task_value +
@@ -769,45 +711,9 @@ class NaiveStrategy(BaseStrategy):
             # Remove selected parcel from consideration
             parcels.remove(best["parcel"])
 
-        projected_battery_remaining = max(0.0, battery)
+        # reported as a percentage of capacity (the confidence and narration code works in percent)
+        projected_battery_remaining = max(0.0, battery) / float(self.drone.power.capacity) * 100.0
         return plan, projected_battery_remaining
-
-    def _choose_drop_cell(
-            self,
-            pick: Tuple[int, int],
-            station: Optional[Dict[str, Any]],
-    ) -> Tuple[int, int]:
-        if not station:
-            return pick
-
-        # We need access to the real terrain object to check occupancy
-        terrain = self.drone.terrain if hasattr(self.drone, "terrain") else None
-        if terrain is None:
-            # fallback to original behavior if terrain not available
-            return (
-                station["col"] + station["w"] // 2,
-                station["row"] + station["h"] // 2,
-            )
-
-        # Get actual DeliveryStation object
-        real_station = terrain.get_station_at(station["col"], station["row"])
-        if real_station is None:
-            return pick
-
-        # Ask the station for free cells based on real occupancy
-        free = real_station.free_cells(terrain)
-
-        # If everything is blocked, fallback to any station cell
-        if not free:
-            free = real_station.parking_cells()
-
-        # Choose nearest free cell to pickup
-        chosen = min(
-            free,
-            key=lambda c: abs(c[0] - pick[0]) + abs(c[1] - pick[1])
-        )
-
-        return chosen
 
     # ------------------------------------------------------------------
     # Reactive fallback logic (unchanged from original)
@@ -820,14 +726,16 @@ class NaiveStrategy(BaseStrategy):
             parcels: list[dict],
             station: dict,
             known_weight: bool = True,
-            safety_margin: float = 3.0,
+            safety_margin: Optional[float] = None,
     ) -> Optional[Dict]:
         """
         Reactive fallback: select the next feasible parcel and emit
         execution evidence for posterior confidence analysis.
         """
         current_cell = progress["current_cell"]
-        battery = float(progress["battery_pct"])
+        battery = float(progress.get("battery_energy", progress["battery_pct"]))   # energy units
+        if safety_margin is None:
+            safety_margin = self.FEASIBILITY_MARGIN
 
         attempted = progress.get("attempted_parcels", set())
         failed = progress.get("failed_parcels", set())
@@ -851,8 +759,7 @@ class NaiveStrategy(BaseStrategy):
             est_weight = true_weight if known_weight else NOMINAL_WEIGHT
 
             # Estimated energy cost
-            est_cost = (self.physics.energy_cost(distance=self.physics.distance(a=current_cell, b=pick), weight=0.0)
-                        + self.physics.energy_cost(distance=self.physics.distance(a=pick, b=drop), weight=est_weight))
+            est_cost = self.trip_energy(current_cell, pick, drop, est_weight)
 
             # Feasibility check
             if battery < est_cost + safety_margin:

@@ -26,7 +26,6 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
 
     BID_INTERVAL = 5
     BID_EXPIRY = 20
-    FEASIBILITY_MARGIN = 3.0
 
 
     def __init__(self, physics=None):
@@ -70,6 +69,9 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
         self.path = []  # Execution order (usually same as bundle)
         self.c = {}  # Marginal gains for tasks: task_id -> score
         self.MAX_BUNDLE_SIZE = 3  # or 5, configurable
+        # False: the published fixed bundle length. True: this agent's bundle length is its share of the open tasks by capability (speed and battery of the
+        # whole declared fleet), the same rule SPPDEC uses (`capability_caps`); an arm sets it, the published arm leaves it off.
+        self.capability_bundle = False
 
     def set_drone(self, drone):
         super().set_drone(drone)
@@ -90,9 +92,7 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
             "t": dict(self.t),
         }
 
-        for agent in self.drone.terrain.agents.values():
-            if agent.agent_id != self.agent_id:
-                self.drone.send_message(agent, payload, step)
+        self.drone.broadcast(payload, step)
 
     def _process_messages(self, step: int):
         if step == self.last_processed_step:
@@ -128,16 +128,14 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
                 zj_task = zj.get(task, float("-inf"))
                 tj_task = tj.get(task, -1)
 
-                update = False
-
-                if tj_task > ti:
-                    update = True
-                elif tj_task == ti:
-                    if zj_task > zi:
-                        update = True
-                    elif zj_task == zi:
-                        if (yj_task or "") > (yi or ""):
-                            update = True
+                # Conflict resolution of published CBBA (Choi, Brunet, How 2009): the higher winning bid wins, a tie goes to the lower
+                # agent id; the timestamp only orders two reports about the same winner (the newer one replaces the older).
+                if yj_task == yi:
+                    update = tj_task > ti
+                elif zj_task != zi:
+                    update = zj_task > zi
+                else:
+                    update = (yj_task or "") < (yi or "") if yi is not None and yj_task is not None else yj_task is not None
 
                 if update:
                     self.y[task] = yj_task
@@ -270,7 +268,7 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
         # -------------------------
         # Multi-task bidding (true CBBA)
         # -------------------------
-        if len(self.bundle) < self.MAX_BUNDLE_SIZE:
+        if len(self.bundle) < self._bundle_limit(snapshot, parcels):
             scored = []
 
             for p in parcels:
@@ -392,6 +390,29 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
     # Cost model
     # -----------------------------
 
+    def _bundle_limit(self, snapshot, parcels):
+        """Bundle length of this agent: the fixed length, or with `capability_bundle` its capability share of the open tasks (declared start information only:
+        speeds, consumption rates and starting batteries of the fleet, own current battery)."""
+        if not self.capability_bundle:
+            return self.MAX_BUNDLE_SIZE
+        from src.strategies.sppdec.cbba_assumed_bids import capability_caps
+        station = snapshot.get("nearest_station")
+        if not station or not parcels or not hasattr(self.drone, "fleet_ids"):
+            return self.MAX_BUNDLE_SIZE
+        drop = (station["col"] + station["w"] // 2, station["row"] + station["h"] // 2)
+        agents = []
+        for aid in self.drone.fleet_ids():
+            spec = self.drone.declared_spec(aid)
+            if spec is None:
+                continue
+            me = aid == self.agent_id
+            agents.append({"id": aid, "speed": float(getattr(spec, "speed", 1.0) or 1.0), "rate": self.drone._declared_rate(aid),
+                           "remaining": float(self.drone.power.level) if me else float(spec.capacity)})
+        tasks = [{"id": p["id"], "pickup": (p["col"], p["row"]), "weight": p.get("weight", 1.0)} for p in parcels]
+        caps = capability_caps(agents, tasks, drop, lambda a, b: self.physics.distance(a, b), lambda d, w: self.physics.energy_cost(distance=d, weight=w),
+                               lambda w: self.physics.pick_drop_cost(w), float(self.drone.power.floor))
+        return caps.get(self.agent_id, self.MAX_BUNDLE_SIZE)
+
     def _marginal_gain(self, snapshot, parcel):
         task_id = parcel["id"]
 
@@ -431,12 +452,12 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
                 self.path[pos:]
         )
 
-        cost = self._estimate_bundle_cost(snapshot, candidate_path)
+        cost = self._estimate_bundle_cost(snapshot, candidate_path, with_time=False)
         battery = float(self.drone.power.level)
 
         return battery >= cost + self.FEASIBILITY_MARGIN
 
-    def _estimate_bundle_cost(self, snapshot, path):
+    def _estimate_bundle_cost(self, snapshot, path, with_time=True):
         if not path:
             return 0.0
 
@@ -445,22 +466,18 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
         station = snapshot["nearest_station"]
 
         total = 0.0
+        clock = 0.0          # steps flown along the path so far: time is charged at each task's completion, so a later task in a bundle costs more
 
         for task_id in path:
             parcel = next(p for p in snapshot["all_parcels"] if p["id"] == task_id)
 
             pick = (parcel["col"], parcel["row"])
-            drop = (
-                station["col"] + station["w"] // 2,
-                station["row"] + station["h"] // 2,
-            )
+            drop = self._bid_drop(pick, station)
 
-            total += self.physics.energy_cost(
-                self.physics.distance(cur, pick), 0.0
-            )
-            total += self.physics.energy_cost(
-                self.physics.distance(pick, drop), parcel["weight"]
-            )
+            total += self.trip_energy(cur, pick, drop, parcel["weight"])
+            if with_time:
+                clock += self.trip_time(cur, pick, drop)
+                total += self.time_weight * clock
 
             cur = drop
 
@@ -475,19 +492,9 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
 
         cur = (agent["col"], agent["row"])
         pick = (parcel["col"], parcel["row"])
-        drop = (
-            station["col"] + station["w"] // 2,
-            station["row"] + station["h"] // 2,
-        )
+        drop = self._bid_drop(pick, station)
 
-        d1 = self.physics.distance(cur, pick)
-        d2 = self.physics.distance(pick, drop)
-
-        cost = (
-                self.physics.energy_cost(d1, 0.0) +
-                self.physics.energy_cost(d2, parcel["weight"]) +
-                2 * self.physics.energy_cost(0.0, parcel["weight"])
-        )
+        cost = self.trip_energy(cur, pick, drop, parcel["weight"])
 
         battery = float(self.drone.power.level)
         feasible = battery >= cost + self.FEASIBILITY_MARGIN
@@ -504,35 +511,4 @@ class LoadBalancedCBBADecentralizedStrategy(BaseStrategy):
         if not feasible:
             return None
 
-        return cost
-
-    def _choose_drop_cell(
-            self,
-            pick: tuple[int, int],
-            station: Optional[Dict[str, Any]],
-    ) -> tuple[int, int]:
-        if not station:
-            return pick
-
-        terrain = self.drone.terrain if hasattr(self.drone, "terrain") else None
-        if terrain is None:
-            return (
-                station["col"] + station["w"] // 2,
-                station["row"] + station["h"] // 2,
-            )
-
-        real_station = terrain.get_station_at(station["col"], station["row"])
-        if real_station is None:
-            return pick
-
-        free = real_station.free_cells(terrain)
-
-        if not free:
-            free = real_station.parking_cells()
-
-        chosen = min(
-            free,
-            key=lambda c: abs(c[0] - pick[0]) + abs(c[1] - pick[1])
-        )
-
-        return chosen
+        return cost + self.time_weight * self.trip_time(cur, pick, drop)       # the bid also prices the trip's time when the arm asks (time_weight > 0)

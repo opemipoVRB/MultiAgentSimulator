@@ -1,4 +1,5 @@
 # Byte-compiled / optimized / DLL files
+.ignore/
 __pycache__/
 *.py[codz]
 *$py.class
@@ -224,3 +225,8 @@ analysis/notebooks/figures/
 analysis/results/
 report/*.png
 report/*.csv
+# Revision release: per-mission summaries and the trained MARL policy behind the paper's tables
+!data/
+!data/**
+analysis/revision/output*/
+/~/

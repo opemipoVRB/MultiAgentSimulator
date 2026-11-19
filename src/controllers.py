@@ -1,14 +1,24 @@
 # src/controllers.py
+import os
 import random
 import time
+from dataclasses import replace
 from typing import Optional, Tuple, List, Dict
 
 import pygame
+
+from src.interface import Command
+from src.onboard import OnboardServices
+from src.perception import Perception
+from src.world_port import WorldPort
 
 # If True, AI will attempt trips even if it cannot guarantee a return-to-base.
 # The drone will be allowed to attempt pickup/drop and may become lost if battery drains mid-route.
 
 ALLOW_RISKY_TRIPS = True
+
+# A drone without work asks the ground station over the radio at most this often (steps; 0.5 s at 60 steps/s).
+REQUEST_INTERVAL_STEPS = 30
 
 
 class BaseAgentController:
@@ -135,6 +145,14 @@ class HumanAgentController(BaseAgentController):
         self._last_keys = keys
 
 
+# Pick policy, applied identically to every strategy that uses AIAgentController.
+#   off      as submitted: the drone picks up whatever parcel is in its cell when it stops
+#   log      as submitted, but every stop on a parcel the current plan does not name is recorded
+#   enforce  the drone picks up only the parcel its current plan names and leaves any other
+# Set with CONTROLLER_PICK_POLICY; recorded in each experiment's provenance.
+PICK_POLICY = os.getenv("CONTROLLER_PICK_POLICY", "log")
+
+
 class AIAgentController(BaseAgentController):
     """
     Planner-driven AI controller.
@@ -149,138 +167,105 @@ class AIAgentController(BaseAgentController):
       - Prefers free cells inside nearest station and avoids repeating the same station cell when possible.
     """
 
-    def __init__(self, drone, terrain, strategy, topology, flight_recorder=None):
+    def __init__(self, drone, terrain, strategy, topology, flight_recorder=None, sensor=None, start_info=None,
+                 run_seed=0, port=None):
         super().__init__(drone, terrain)
         self.state = "idle"
         self.plan: List[Dict] = []
         self.plan_idx: int = 0
         self.no_feasible_plan = False
-        self._no_plan_battery_threshold = 15.0
         self.cooldown = 0.0
-        self._last_plan_time = 0.0
-        self._last_action_time = 0.0
         self.last_narration: Optional[str] = None
         self._last_chosen_drop: Optional[Tuple[int, int]] = None
         self.parked = False
         self.parking_in_progress = False
-        self.parking_target = None
+        self._ledger_idle = False       # idle because the station is believed full (reversible: a fresh view that says otherwise restarts the drone)
         self.plan_confidence: float = 0.0
         self.flight_recorder = flight_recorder
         self.strategy = strategy
-        self.awaiting_cc_response = False
         self.topology = topology
-        self.needs_requery = True
         self.current_step = 0
+        self._leg_started = 0        # the step the drone began its present leg toward a pickup (for what a lost race cost)
+        self.agent_id = drone.agent_id
+        # In a drone process there is no world to read: the world sends observations and carries out commands.
+        self.port = port if port is not None else WorldPort(drone, terrain, sensor, start_info, run_seed)
+        # What the drone knows is built from what it senses; every strategy acts on this.
+        self.perception = Perception(unseen_weight=getattr(strategy, "unseen_parcel_weight", 1.0),
+                                     station_memory=getattr(strategy, "station_memory", "observed"),
+                                     ledger_stop=getattr(strategy, "ledger_stop", False),
+                                     declared_weights=getattr(strategy, "declared_weights", False))
+        self.services = OnboardServices(drone, run_seed, start_info)   # what the drone's strategy may use of the drone
+        self._obs = None
+        self._commands: List[Command] = []      # what the drone will do this step, in order
+        self._signals: Dict = {}                # what it tells the world besides commands (for example, abort)
+        self._pending = None                    # the command whose answer arrives with the next observation
+        self._last_request_step = -REQUEST_INTERVAL_STEPS   # when this drone last asked the ground station for work
+        # The onboard side holds no reference to the world: everything goes through the port.
+        self.drone = None
+        self.terrain = None
 
         print(
-            f"[INIT] AI controller for {drone.agent_id} "
+            f"[INIT] AI controller for {self.agent_id} "
             f"parked={self.parked} "
             f"strategy={type(strategy).__name__}"
         )
 
-    def needs_decision(self):
-        return (
-                not self.plan
-                and not self.no_feasible_plan
-                and not self.drone.moving
-        )
+    def _log_plan_outcome(self, outcome: str, cell=None, planned_cell=None):
+        if self.flight_recorder is not None and hasattr(self.flight_recorder, "record_plan_outcome"):
+            self.flight_recorder.record_plan_outcome(
+                agent_id=self.agent_id, step=self.current_step, outcome=outcome,
+                cell=cell, planned_cell=planned_cell, started=self._leg_started)
 
-    def compute_decision(self):
-        if self.topology == "centralized":
-            return self.terrain.command_center.request_directive(self.drone.agent_id)
-        snap = self._make_snapshot()
-        snap["step"] = getattr(self, "current_step", 0)
-        return self.strategy.decide(snap)
+    def _job_done(self, snap) -> bool:
+        """The drone's belief that every parcel is delivered: the station memory says so, or the strategy's own prediction of the station does."""
+        if not getattr(self.strategy, "ledger_stop", False):
+            return False
+        return bool(snap.get("ledger_done")) or bool(self.strategy.predicts_job_done(snap))
 
-    def apply_decision(self, decision):
-        mode = decision.get("mode")
+    def _strategy_step(self, step: int):
+        """Give the strategy its per-cycle call and execute the directive it returns."""
+        snap = self._snapshot_from(self._obs)
+        snap["step"] = step
+        directive = self.strategy.step(snap)
+        if directive is None and self._job_done(snap) and not self._obs.carrying:
+            directive = {"mode": "interrupt", "reason": "ledger_complete"}      # the station holds every parcel: the plan is a ghost
+        if directive and directive.get("mode") == "interrupt":
+            return self._interrupt_plan(directive.get("reason"))
+        return False
 
-        if mode == "plan":
-            self._load_plan(decision["plan"])
-        elif mode == "wait":
-            return
-        elif mode == "idle":
-            self.no_feasible_plan = True
-            self.state = "idle"
-            print(
-                f"[CTRL][STATE] agent={self.drone.agent_id} -> idle | no_feasible_plan={self.no_feasible_plan} | parked={self.parked}"
-            )
-        else:
-            raise RuntimeError(f"Unknown strategy mode: {mode}")
+    def _interrupt_plan(self, reason=None) -> bool:
+        """Cancel the plan being executed (not while carrying) so the agent decides again. True if it did."""
+        if not self.plan or self._obs.carrying:
+            return False
+        st = self._current_step()
+        self._log_plan_outcome("interrupt_" + str(reason), planned_cell=tuple(st["pickup"]) if st else None)
+        self.plan = []
+        self.plan_idx = 0
+        self._commands.append(Command("stop"))
+        self.state = "idle"
+        return True
+
+
+
 
     # ---------------------------
     # Planner interaction
     # ---------------------------
-    def _make_snapshot(self) -> Dict:
-        """
-        Create a compact, perception-only snapshot of the world state.
+    def _dispatch(self, events) -> None:
+        """Hand what the drone's senses just noticed to the strategy, if it listens."""
+        if events:
+            handler = getattr(self.strategy, "on_perception_events", None)
+            if handler is not None:
+                handler(events)
 
-        This snapshot represents the agent's *local world view* at the current
-        decision step. It contains only observable state and internal proprioception.
-        It does NOT contain predictions, intentions, plans, or coordination signals.
+    def _snapshot_from(self, obs) -> Dict:
+        """The legacy snapshot dict for an observation the controller already holds."""
+        return self.perception.snapshot(obs)
 
-        The snapshot is the sole input to all decentralized strategies
-        (Naive, SPPDEC Phase 1).
-        """
-        snap = {
-            "agent": {
-                "id": self.drone.agent_id,
-                "col": int(self.drone.col),
-                "row": int(self.drone.row),
-            },
-            "carrying": {
-                "has": bool(self.drone.carrying),
-                "weight": (
-                    getattr(self.drone.carrying, "weight", 0.0)
-                    if self.drone.carrying
-                    else 0.0
-                ),
-            },
-            "nearest_station": None,
-            "all_parcels": [],
-            "other_agents": [],
-            "step": getattr(self, "current_step", 0),
-            "timestamp": time.time(),
-        }
+    @staticmethod
+    def _battery_percent(obs) -> float:
+        return 0.0 if obs.capacity <= 0 else max(0.0, min(100.0, (obs.battery / obs.capacity) * 100.0))
 
-        # Nearest station
-        station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-        if station:
-            snap["nearest_station"] = {
-                "col": int(station.col),
-                "row": int(station.row),
-                "w": int(station.w),
-                "h": int(station.h),
-            }
-
-        # Parcels
-        for p in self.terrain.parcels:
-            snap["all_parcels"].append(
-                {
-                    "id": getattr(p, "id", None),
-                    "col": int(p.col),
-                    "row": int(p.row),
-                    "weight": getattr(p, "weight", 1.0),
-                    "picked": bool(getattr(p, "picked", False)),
-                    "delivered": bool(getattr(p, "delivered", False)),
-                }
-            )
-
-        # Other agents
-        for agent in self.terrain.agents.values():
-            if agent is self.drone:
-                continue
-
-            snap["other_agents"].append(
-                {
-                    "id": agent.agent_id,
-                    "col": int(agent.col),
-                    "row": int(agent.row),
-                    "carrying": bool(getattr(agent, "carrying", None)),
-                }
-            )
-
-        return snap
 
     def _trim_narration(self, text: str) -> Optional[str]:
         if not text:
@@ -320,13 +305,13 @@ class AIAgentController(BaseAgentController):
                 "strategy": "unknown",
             }
             print(
-                f"[PLAN-WARN] agent={self.drone.agent_id} "
+                f"[PLAN-WARN] agent={self.agent_id} "
                 f"received legacy plan list. Coercing into plan envelope."
             )
 
         if not isinstance(plan_obj, dict):
             print(
-                f"[PLAN-ERROR] agent={self.drone.agent_id} "
+                f"[PLAN-ERROR] agent={self.agent_id} "
                 f"invalid plan object type={type(plan_obj)}. Ignoring."
             )
             print(f"1 I got an Invalid plan so I set self.no_feasible_plan to True from CBBA {self.strategy} ")
@@ -357,7 +342,7 @@ class AIAgentController(BaseAgentController):
         self.plan = parsed
         self.plan_idx = 0
         self.no_feasible_plan = not bool(self.plan)
-        self._last_plan_time = time.time()
+        self._leg_started = self.current_step
 
         # Capture metadata
         self.plan_confidence = float(
@@ -370,7 +355,7 @@ class AIAgentController(BaseAgentController):
         # Flight recorder
         if self.flight_recorder and self.plan:
             self.flight_recorder.record_initial_plan(
-                agent_id=self.drone.agent_id,
+                agent_id=self.agent_id,
                 plan=self.plan,
                 confidence=self.plan_confidence,
                 projected_battery=plan_obj.get("projected_battery_remaining"),
@@ -380,7 +365,7 @@ class AIAgentController(BaseAgentController):
 
         # Debug logging
         print(
-            f"[PLAN-COMMIT] agent={self.drone.agent_id} "
+            f"[PLAN-COMMIT] agent={self.agent_id} "
             f"steps={len(self.plan)} "
             f"confidence={self.plan_confidence:.3f} "
             f"strategy={plan_obj.get('strategy', 'unknown')}"
@@ -404,36 +389,20 @@ class AIAgentController(BaseAgentController):
         current step with a feasible alternative before advancing.
         """
         if getattr(self.strategy, "enable_reactive_fallback", False):
+            o = self._obs
             progress = {
-                "current_cell": (int(self.drone.col), int(self.drone.row)),
-                "battery_pct": float(self.drone.power.percent()),
+                "current_cell": (o.col, o.row),
+                "battery_pct": self._battery_percent(o),
+                "battery_energy": o.battery,
                 "attempted_parcels": set(),
                 "failed_parcels": set(),
             }
-
-            station_obj = self.terrain.nearest_station(self.drone.col, self.drone.row)
-            station = None
-            if station_obj:
-                station = {
-                    "col": int(station_obj.col),
-                    "row": int(station_obj.row),
-                    "w": int(station_obj.w),
-                    "h": int(station_obj.h),
-                }
+            snap_o = self.perception.snapshot(o)
+            station = snap_o["nearest_station"]
 
             next_choice = self.strategy.choose_best_feasible_next_parcel(
                 progress=progress,
-                parcels=[
-                    {
-                        "id": getattr(p, "id", None),
-                        "col": p.col,
-                        "row": p.row,
-                        "weight": getattr(p, "weight", 1.0),
-                        "picked": getattr(p, "picked", False),
-                        "delivered": getattr(p, "delivered", False),
-                    }
-                    for p in self.terrain.parcels
-                ],
+                parcels=snap_o["all_parcels"],
                 station=station,
                 known_weight=True,
             )
@@ -462,12 +431,12 @@ class AIAgentController(BaseAgentController):
 
                     if self.flight_recorder:
                         self.flight_recorder.record_plan_change(
-                            agent_id=self.drone.agent_id,
+                            agent_id=self.agent_id,
                             old_step=old_step,
                             new_step=self.plan[self.plan_idx],
                             estimated_cost=next_choice.get("estimated_cost"),
                             battery_before=progress["battery_pct"],
-                            battery_after=self.drone.power.percent(),
+                            battery_after=self._battery_percent(o),
                             prior_confidence=prior,
                             posterior_confidence=posterior,
                             reason="reactive_fallback",
@@ -476,7 +445,7 @@ class AIAgentController(BaseAgentController):
                         )
 
                         self.flight_recorder.record_confidence_update(
-                            agent_id=self.drone.agent_id,
+                            agent_id=self.agent_id,
                             confidence=posterior,
                             modifier=modifier,
                             note="reactive_fallback_confidence_revision",
@@ -485,12 +454,12 @@ class AIAgentController(BaseAgentController):
                         )
 
                     print(
-                        f"[CONFIDENCE-UPDATE] agent={self.drone.agent_id} "
+                        f"[CONFIDENCE-UPDATE] agent={self.agent_id} "
                         f"{prior:.3f} → {self.plan_confidence:.3f}"
                     )
 
                 print(
-                    f"[REACTIVE-FALLBACK] agent={self.drone.agent_id} "
+                    f"[REACTIVE-FALLBACK] agent={self.agent_id} "
                     f"at={progress['current_cell']} "
                     f"battery={progress['battery_pct']:.1f}%\n"
                     f"  replaced pickup {old_step['pickup']} → {next_choice['pickup']} "
@@ -501,185 +470,15 @@ class AIAgentController(BaseAgentController):
 
         # Normal plan advancement
         self.plan_idx += 1
+        self._leg_started = self.current_step
 
         if self.plan_idx >= len(self.plan):
             self.plan = []
             self.plan_idx = 0
             self.state = "idle"
             print(
-                f"[CTRL][STATE] agent={self.drone.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
+                f"[CTRL][STATE] agent={self.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
             )
-
-    def _ensure_energy_for_route(
-            self,
-            from_cell: Tuple[int, int],
-            to_cell: Tuple[int, int],
-            carry_weight: float = 0.0,
-            require_return: bool = False,
-    ) -> bool:
-        """
-        Conservative energy check for the leg from_cell -> to_cell.
-        """
-        dist = abs(from_cell[0] - to_cell[0]) + abs(from_cell[1] - to_cell[1])
-        needed = self.drone.energy_needed_for_cells(dist, carry_weight)
-
-        if require_return:
-            station = self.terrain.nearest_station(from_cell[0], from_cell[1])
-            if station:
-                home_col = int(station.col + station.w // 2)
-                home_row = int(station.row + station.h // 2)
-                dist_back = abs(to_cell[0] - home_col) + abs(to_cell[1] - home_row)
-                needed += self.drone.energy_needed_for_cells(dist_back, 0.0)
-
-        return self.drone.power.level >= needed
-
-    def _request_parking(self) -> Optional[Tuple[int, int]]:
-        station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-        if not station:
-            return None
-        return station.park_drone(self.drone)
-
-    def _begin_parking(self):
-        """
-        Request a parking allocation from the nearest station and, if granted,
-        initiate movement toward the allocated cell.
-        """
-        if self.parking_in_progress or self.parked:
-            return
-
-        cell = self._request_parking()
-        if cell is None:
-            return
-
-        self.parking_target = cell
-        self.parking_in_progress = True
-
-        self.drone.set_target_cell(cell[0], cell[1])
-
-        print(
-            f"[PARK-START] agent={self.drone.agent_id} "
-            f"from=({self.drone.col},{self.drone.row}) "
-            f"to={cell}"
-        )
-
-    # ---------------------------
-    # Delivery cell chooser
-    # ---------------------------
-    def _choose_delivery_cell(self) -> Tuple[int, int]:
-        """
-        Choose a delivery cell. Preference order:
-
-          1. Nearest free cell inside the nearest station to the drone.
-          2. If no free cells, nearest station cell (even if occupied),
-             avoiding repeating the last chosen cell when possible.
-          3. If no station, pick a free non station cell on the map,
-             avoiding last chosen when possible.
-          4. Fallback to current drone cell.
-
-        The chosen cell is stored in self._last_chosen_drop.
-        """
-        station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-
-        def _set_and_return(cell: Tuple[int, int]) -> Tuple[int, int]:
-            if station:
-                print(
-                    f"[STATION STATE @ PARK DECISION] agent={self.drone.agent_id} "
-                    f"{station.debug_state()}"
-                )
-                print(
-                    f"[PARKING] agent={self.drone.agent_id} "
-                    f"target_cell={cell} "
-                    f"station=({station.col},{station.row}) "
-                    f"occupied={self.terrain.occupied_cell(cell[0], cell[1])}"
-                )
-            else:
-                print(
-                    f"[PARKING] agent={self.drone.agent_id} "
-                    f"target_cell={cell} "
-                    f"station=None "
-                    f"occupied={self.terrain.occupied_cell(cell[0], cell[1])}"
-                )
-
-            self._last_chosen_drop = cell
-            return cell
-
-        # Station present
-        if station:
-            try:
-                nearest_free = station.least_used_free_cell(
-                    self.terrain,
-                    ref_col=self.drone.col,
-                    ref_row=self.drone.row,
-                )
-            except Exception:
-                nearest_free = None
-
-            if nearest_free is not None:
-                return _set_and_return(nearest_free)
-
-            # No free cells - choose any station cell
-            cells = [
-                (c, r)
-                for r in range(station.row, station.row + station.h)
-                for c in range(station.col, station.col + station.w)
-            ]
-
-            cells_sorted = sorted(
-                cells,
-                key=lambda c: (
-                    abs(c[0] - self.drone.col) + abs(c[1] - self.drone.row),
-                    c[1],
-                    c[0],
-                ),
-            )
-
-            if (
-                    self._last_chosen_drop is not None
-                    and self._last_chosen_drop in cells_sorted
-                    and len(cells_sorted) > 1
-            ):
-                cells_sorted = (
-                        [c for c in cells_sorted if c != self._last_chosen_drop]
-                        + [self._last_chosen_drop]
-                )
-
-            return _set_and_return(cells_sorted[0])
-
-        # No station on the map
-        cols = self.terrain.screen_size[0] // self.terrain.grid_size
-        rows = self.terrain.screen_size[1] // self.terrain.grid_size
-        attempts = 0
-        chosen: Optional[Tuple[int, int]] = None
-
-        while attempts < 400:
-            c = random.randint(0, cols - 1)
-            r = random.randint(0, rows - 1)
-
-            if (c, r) == (self.drone.col, self.drone.row):
-                attempts += 1
-                continue
-
-            if self.terrain.is_station_cell(c, r):
-                attempts += 1
-                continue
-
-            if (
-                    not self.terrain.occupied_cell(c, r)
-                    and (c, r) != self._last_chosen_drop
-            ):
-                chosen = (c, r)
-                break
-
-            if attempts > 50 and not self.terrain.occupied_cell(c, r):
-                chosen = (c, r)
-                break
-
-            attempts += 1
-
-        if chosen is None:
-            chosen = (self.drone.col, self.drone.row)
-
-        return _set_and_return(chosen)
 
     def _consume_inbox(self) -> bool:
         """
@@ -712,15 +511,14 @@ class AIAgentController(BaseAgentController):
             True if a message was processed.
             False if the inbox was empty.
         """
-        if not self.drone.inbox:
+        if not self.services.inbox:
             return False
 
-        sender_id, message = self.drone.inbox.pop(0)
+        sender_id, message = self.services.inbox.pop(0)
 
-        self.awaiting_cc_response = False
 
         print(
-            f"[CTRL][INBOX] agent={self.drone.agent_id} "
+            f"[CTRL][INBOX] agent={self.agent_id} "
             f"from={sender_id} "
             f"payload={message}"
         )
@@ -747,25 +545,23 @@ class AIAgentController(BaseAgentController):
             return True
 
         if mode == "wait":
-            self.needs_requery = False
             return True
 
         if mode == "idle":
             print(f"1 I got a request to set self.no_feasible_plan to True from CBBA {self.strategy} ")
             self.no_feasible_plan = True
-            self.needs_requery = False
             print(
-                f"[CTRL][STATE] agent={self.drone.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
+                f"[CTRL][STATE] agent={self.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
             )
             return True
 
         if mode == "abort":
-            print(f"[CTRL][ABORT] agent={self.drone.agent_id} received abort")
+            print(f"[CTRL][ABORT] agent={self.agent_id} received abort")
             self.no_feasible_plan = True
             self.plan = []
             self.state = "idle"
             print(
-                f"[CTRL][STATE][ABORT] agent={self.drone.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
+                f"[CTRL][STATE][ABORT] agent={self.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
             )
 
             return True
@@ -777,39 +573,102 @@ class AIAgentController(BaseAgentController):
             f"Unknown execution directive mode delivered: {mode}"
         )
 
-    def invalidate_decision(self, reason: str):
-        """
-        Called by the embodied agent when something meaningful occurred.
-        This resets the decision lifecycle without time-based polling.
-        """
-        self.needs_requery = True
-        self.awaiting_cc_response = False
 
     # ---------------------------
     # Main update loop
     # ---------------------------
-    def update(self, dt: float, step: int, sim_time: float):
+    # ---------------------------
+    # One step: observe, think, act
+    # ---------------------------
+    def observe(self, step: int, sim_time: float):
+        """The world's reading of this drone for this step (world side; in a separate process it arrives as a message)."""
+        return self.port.observe(step, sim_time)
+
+    def act(self, commands: List[Command], step: int) -> None:
+        """The world carries out this drone's commands (world side)."""
+        self.port.apply_all(commands, step)
+
+    def replay(self, recorder) -> None:
+        """Records written in a drone process are replayed here; in-process they were written directly."""
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def _emit(self, cmd: Command, pending=None) -> None:
+        self._commands.append(cmd)
+        if pending is not None:
+            self._pending = pending
+
+    def _handle_result(self, result, sim_time: float) -> None:
+        """The answer to the command issued on the previous step."""
+        pending, self._pending = self._pending, None
+        if pending is None or result is None:
+            return
+        kind = pending["kind"]
+        if kind == "pick":
+            self._log_plan_outcome("picked" if result.success else "pick_failed", cell=pending["here"],
+                                   planned_cell=pending["planned"])
+            if result.success:
+                self.state = "carrying"
+        elif kind == "drop" and result.success:
+            self._last_chosen_drop = result.cell
+            step_obj = self._current_step()
+            if step_obj:
+                self._advance_plan(step=step_obj, sim_time=sim_time)
+            # Tell the ground station over the radio that the task is complete
+            if self.topology == "centralized":
+                self.services.send("command_center", {"type": "completed"})
+        elif kind == "park" and result.success:
+            self.parking_in_progress = True
+            print(f"[PARK-REQUEST] agent={self.agent_id} assigned_cell={result.cell}")
+
+    def think(self, obs, dt: float, step: int, sim_time: float):
         """
-        Main per-tick control loop for the agent.
+        One step of the drone's own software, from what it has been told. Returns (commands, signals): what the drone
+        will do this step, in order, and anything it tells the world besides (for example a request to abort).
 
-        Responsibilities handled here, in priority order:
-
-        1. Physical constraints and lifecycle
-        2. Network realism
+        Responsibilities, in priority order:
+        1. The answer to last step's command, and what the senses noticed
+        2. Physical constraints and lifecycle
         3. Immediate embodied actions
         4. Strategy decision phase
         5. Execution phase
         """
         self.current_step = step
+        self._obs = obs
+        self._commands = []
+        self._signals = {}
+        self.services.take_in(obs)
+        self._handle_result(obs.last_result, sim_time)
+        self._dispatch(self.perception.update(obs))   # the drone senses on every step, not only when it decides
 
+        # Per-cycle strategy call (strategies that declare steps_every_cycle).
+        if getattr(self.strategy, "steps_every_cycle", False) or getattr(self.strategy, "ledger_stop", False):
+            if self._strategy_step(step):
+                # the plan was cancelled and the drone has been told to stop
+                obs = replace(obs, moving=False)
+                self._obs = obs
+
+        self._act(obs, dt, step, sim_time)
+        self._signals["parked"] = bool(self.parked)        # status the drone reports to the world
+        outgoing = self.services.take_outbox()
+        if outgoing:
+            self._commands.append(Command("none", messages=outgoing))
+            if self.flight_recorder is not None and hasattr(self.flight_recorder, "record_message"):
+                here = (int(obs.col), int(obs.row))
+                for to, payload in outgoing:
+                    kind = (payload.get("event") or payload.get("type")) if isinstance(payload, dict) else type(payload).__name__
+                    self.flight_recorder.record_message(agent_id=self.agent_id, step=step, to=to, kind=kind, cell=here)
+        return self._commands, self._signals
+
+    def _act(self, obs, dt: float, step: int, sim_time: float) -> None:
         # Cooldown and hard stop conditions
         if self.cooldown > 0:
             self.cooldown -= dt
 
-        if self.drone.lost:
+        if obs.lost:
             return
-
-        now = time.time()
 
         # Apply any delivered network decisions first
         if self.topology == "centralized":
@@ -818,80 +677,57 @@ class AIAgentController(BaseAgentController):
 
         # Parking completion check
         if self.parking_in_progress:
-            if not self.drone.moving:
+            if not obs.moving:
                 self.parking_in_progress = False
                 self.parked = True
                 print(
-                    f"[PARKED] agent={self.drone.agent_id} "
-                    f"cell=({self.drone.col},{self.drone.row}) "
-                    f"battery={int(self.drone.power.percent())}%"
+                    f"[PARKED] agent={self.agent_id} "
+                    f"cell=({obs.col},{obs.row}) "
+                    f"battery={int(self._battery_percent(obs))}%"
                 )
             return
 
         # Immediate local embodied actions when stationary
-        if not self.drone.moving:
+        if not obs.moving:
 
             # Attempt pick if not carrying and parcel is present
-            if self.drone.carrying is None:
-                p_here = self.terrain.parcel_at_cell(self.drone.col, self.drone.row)
+            if not obs.carrying:
+                p_here = obs.here_parcel_weight is not None
+                here = (obs.col, obs.row)
+                planned = self._current_step()
+                planned_cell = tuple(planned["pickup"]) if planned else None
+                if p_here and planned_cell != here and PICK_POLICY != "off":
+                    # A parcel is here that the current plan does not name
+                    self._log_plan_outcome(
+                        "unplanned_parcel_ignored" if PICK_POLICY == "enforce" else "unplanned_parcel_present",
+                        cell=here, planned_cell=planned_cell)
+                    if PICK_POLICY == "enforce":
+                        p_here = False
                 if p_here:
-                    success = self.drone.perform_pick(p_here)
-                    if not success:
-                        self.drone.last_action = (
-                            "pick_failed",
-                            (self.drone.col, self.drone.row),
-                            None,
-                        )
-                    else:
-                        self.state = "carrying"
-                        self._last_action_time = now
+                    self._emit(Command("pick"), pending={"kind": "pick", "here": here, "planned": planned_cell})
                     return
 
             # Attempt drop if carrying and inside station
-            station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-            if (
-                    self.drone.carrying
-                    and station
-                    and station.contains_cell(self.drone.col, self.drone.row)
-            ):
-                parcel_ref = self.drone.carrying
-                success = self.drone.perform_drop(parcel_ref)
-
-                if success:
-                    self._last_chosen_drop = (self.drone.col, self.drone.row)
-
-                    step_obj = self._current_step()
-                    if step_obj:
-                        self._advance_plan(step=step_obj, sim_time=sim_time)
-
-                    # Inform CommandCenter that task is complete
-                    if self.topology == "centralized":
-                        cc = self.terrain.command_center
-                        strategy = cc.strategy
-
-                        record = strategy.agents.get(self.drone.agent_id)
-                        record = strategy.agents.get(self.drone.agent_id)
-                        if record and record["state"] == "executing":
-                            parcel_id = record["task"]
-
-                            strategy.report_task_completed(self.drone.agent_id, parcel_id)
-                            # Clear directive lock immediately
-                            cc._directive_in_flight.discard(self.drone.agent_id)
-
-                            # Allow immediate requery
-                            self.awaiting_cc_response = False
-                            print(f"[CENTRAL][COMPLETE] agent={self.drone.agent_id} task={parcel_id}")
-
-                    return
-                else:
-                    alt = station.least_used_free_cell(
-                        self.terrain,
-                        ref_col=self.drone.col,
-                        ref_row=self.drone.row,
-                    )
-                    if alt:
-                        self.drone.set_target_cell(*alt)
+            if obs.carrying and obs.station and obs.inside_station:
+                self._emit(Command("drop"), pending={"kind": "drop"})
                 return
+
+        if obs.carrying and not self.plan and obs.station:
+            # A parcel in hand and no plan (a plan cancelled a step before the drone picked up a parcel that was still there; every strategy, whether or not it uses the ledger stop): deliver it.
+            station = self._snapshot_from(obs).get("nearest_station")
+            drop = self.strategy._choose_drop_cell((obs.col, obs.row), station)
+            self._ledger_idle = False
+            self.no_feasible_plan = False
+            self.parked = False
+            self.parking_in_progress = False
+            self._load_plan({"plan": [{"pickup": [obs.col, obs.row], "dropoff": [drop[0], drop[1]], "weight": float(obs.carrying_weight or 1.0)}],
+                             "confidence": 1.0, "strategy": "deliver-carried", "narration": "deliver the parcel in hand"})
+        if self._ledger_idle and not self._job_done(self._snapshot_from(obs)):
+            self._ledger_idle = False
+            self.no_feasible_plan = False
+            self.parked = False
+            self.parking_in_progress = False
+            self.state = "idle"
 
         # Strategy decision phase
         if not self.plan and not self.no_feasible_plan:
@@ -901,13 +737,27 @@ class AIAgentController(BaseAgentController):
                     return
 
             if self.topology == "centralized":
-                if not self.drone.inbox:
-                    decision = self.terrain.command_center.request_directive(self.drone.agent_id)
-                    if decision:
-                        self.drone.inbox.append(("command_center", decision))
+                # Ask the ground station for work over the radio (again after a while: the message can be lost)
+                if not self.services.inbox and step - self._last_request_step >= REQUEST_INTERVAL_STEPS:
+                    self.services.send("command_center", {"type": "request"})
+                    self._last_request_step = step
                 return
 
-            decision = self.strategy.decide(self._make_snapshot())
+            snap_now = self._snapshot_from(obs)
+            if self._job_done(snap_now) and not obs.carrying:
+                station = snap_now.get("nearest_station")
+                if (getattr(self.strategy, "ledger_verify", False) and station and not snap_now.get("ledger_done")
+                        and not snap_now.get("station_in_full_view")):
+                    # The job is done by prediction only: look before parking. From the station centre every cell is in view.
+                    centre = (station["col"] + station["w"] // 2, station["row"] + station["h"] // 2)
+                    if (obs.col, obs.row) != centre:
+                        if not obs.moving:
+                            self._emit(Command("move_to", centre))
+                        return
+                decision = {"mode": "idle", "reason": "ledger_complete"}
+                self._ledger_idle = True
+            else:
+                decision = self.strategy.decide(snap_now)
 
             mode = decision.get("mode")
 
@@ -917,18 +767,30 @@ class AIAgentController(BaseAgentController):
             elif mode == "wait":
                 return
 
+            elif mode == "look":
+                # Any strategy may ask to see the station before it decides (active perception): fly to a cell of the station from where every cell is in view (the centre unless the strategy names one), then decide again.
+                # The strategy may name the cell to look from (so that idle drones do not stack on one cell); without one the drone goes to the centre.
+                station = snap_now.get("nearest_station")
+                if station:
+                    target = decision.get("cell") or (station["col"] + station["w"] // 2, station["row"] + station["h"] // 2)
+                    target = (int(target[0]), int(target[1]))
+                    if (obs.col, obs.row) != target and not obs.moving:
+                        self._emit(Command("move_to", target))
+                return
+
             elif mode == "idle":
                 print(f"2 I got a request to set self.no_feasible_plan to True from CBBA {self.strategy} ")
                 self.no_feasible_plan = True
                 self.state = "idle"
                 print(
-                    f"[CTRL][STATE] agent={self.drone.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
+                    f"[CTRL][STATE] agent={self.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
                 )
 
                 return
 
             elif mode == "abort":
-                print(f"[CTRL][ABORT] agent={self.drone.agent_id} strategy requested abort")
+                print(f"[CTRL][ABORT] agent={self.agent_id} strategy requested abort")
+                self._signals["abort"] = decision.get("reason")
                 self.no_feasible_plan = True
                 self.plan = []
                 self.state = "idle"
@@ -940,57 +802,50 @@ class AIAgentController(BaseAgentController):
 
         # No feasible plan means request parking
         if self.no_feasible_plan:
-            station = self.terrain.nearest_station(self.drone.col, self.drone.row)
-
             # If already safely inside station, park immediately
-            if station and station.contains_cell(self.drone.col, self.drone.row):
+            if obs.station and obs.inside_station:
                 if not self.parked:
                     self.parked = True
                     print(
-                        f"[PARKED] agent={self.drone.agent_id} already inside station"
+                        f"[PARKED] agent={self.agent_id} already inside station"
                     )
                 return
 
             # Otherwise, initiate parking movement
             if not self.parked and not self.parking_in_progress:
-                if station:
-                    cell = station.park_drone(self.drone)
-                    if cell:
-                        self.parking_in_progress = True
-                        self.drone.set_target_cell(*cell)
-                        print(
-                            f"[PARK-REQUEST] agent={self.drone.agent_id} assigned_cell={cell}"
-                        )
+                if obs.station:
+                    self._emit(Command("request_parking"), pending={"kind": "park"})
             return
 
         # Do not override movement once drone is in motion
-        if self.drone.moving:
+        if obs.moving:
             return
 
         # Execution phase: follow plan
         step_obj = self._current_step()
 
-        if self.drone.carrying:
+        if obs.carrying:
             if step_obj:
-                drop_cell = tuple(step_obj["dropoff"])
-                self.drone.set_target_cell(*drop_cell)
+                self._emit(Command("move_to", tuple(step_obj["dropoff"])))
             return
 
         if not step_obj:
             self.state = "idle"
             print(
-                f"[CTRL][STATE] agent={self.drone.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
+                f"[CTRL][STATE] agent={self.agent_id} -> {self.state} | no_feasible_plan = {self.no_feasible_plan} | parked={self.parked}"
             )
             return
 
         pickup = tuple(step_obj["pickup"])
-        pobj = self.terrain.parcel_at_cell(pickup[0], pickup[1])
 
-        if pobj is None or getattr(pobj, "delivered", False):
+        # The drone finds a pickup target missing only by being at the cell. Anything it knows earlier comes
+        # from its strategy, which can interrupt the plan.
+        if (obs.col, obs.row) == pickup and obs.here_parcel_weight is None:
+            self._log_plan_outcome("target_gone", planned_cell=pickup)
             self._advance_plan(step=step_obj, sim_time=sim_time)
             return
 
-        self.drone.set_target_cell(*pickup)
+        self._emit(Command("move_to", pickup))
         self.state = "seeking"
 
 
@@ -1013,17 +868,29 @@ class ControllerSwitcher:
             self.current.handle_event(event)
 
     def update(self, dt: float, step: int, sim_time: float):
-        self.current.update(dt, step, sim_time)
+        return self.current.update(dt, step, sim_time)
 
-    # ADD THESE METHODS:
-    def needs_decision(self):
-        """Delegate to current controller."""
-        return self.current.needs_decision()
+    def observe(self, step: int, sim_time: float):
+        c = self.current
+        return c.observe(step, sim_time) if hasattr(c, "observe") else None
 
-    def compute_decision(self):
-        """Delegate to current controller."""
-        return self.current.compute_decision()
+    def think(self, obs, dt: float, step: int, sim_time: float):
+        """The AI controller thinks from its observation; the human controller acts on the world directly."""
+        c = self.current
+        if hasattr(c, "think"):
+            return c.think(obs, dt, step, sim_time)
+        c.update(dt, step, sim_time)
+        return [], {}
 
-    def apply_decision(self, decision):
-        """Delegate to current controller."""
-        return self.current.apply_decision(decision)
+    def act(self, commands, step: int):
+        c = self.current
+        if hasattr(c, "act"):
+            c.act(commands, step)
+
+    def replay(self, recorder) -> None:
+        return None
+
+    def close(self) -> None:
+        for c in self.controllers:
+            if hasattr(c, "close"):
+                c.close()

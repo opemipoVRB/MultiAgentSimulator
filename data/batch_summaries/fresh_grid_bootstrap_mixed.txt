@@ -1,0 +1,27 @@
+
+=== last_delivery: baseline minus SPPDEC, matched complete-case ===
+  Centralised              configs 59  mean    +50.0  bootstrap 95% CI [   +32.8,    +69.7] | mixed: A -8.39 (p 4.4e-07), P +3.48 (p 0.00038), A/P +17.6 (p 0.15)
+  CBBA single              configs 59  mean    +62.0  bootstrap 95% CI [   +44.8,    +81.9] | mixed: A -7.86 (p 2.4e-06), P +3.89 (p 7.4e-05), A/P +17.7 (p 0.15)
+  CBBA capability bundle   configs 59  mean   +125.6  bootstrap 95% CI [   +99.6,   +152.0] | mixed: A -10.05 (p 2e-07), P +8.61 (p 5e-14), A/P +20.9 (p 0.14)
+  CBBA bundle              configs 58  mean   +220.4  bootstrap 95% CI [  +184.9,   +256.8] | mixed: A -2.33 (p 0.48), P +7.55 (p 9.2e-05), A/P -32.2 (p 0.18)
+  MARL                     configs 59  mean   +184.6  bootstrap 95% CI [  +156.0,   +214.3] | mixed: A +8.17 (p 7.3e-05), P +6.56 (p 6.8e-08), A/P -24.9 (p 0.097)
+  Naive                    configs 59  mean   +307.3  bootstrap 95% CI [  +277.6,   +337.2] | mixed: A +11.23 (p 5.5e-06), P +1.20 (p 0.41), A/P -93.3 (p 2.1e-07)
+  Auction                  configs 58  mean   +456.2  bootstrap 95% CI [  +374.6,   +543.2] | mixed: A +30.14 (p 2e-09), P +15.10 (p 5.8e-07), A/P -100.7 (p 0.0056)
+
+=== makespan: baseline minus SPPDEC, matched complete-case ===
+  Centralised              configs 59  mean    +31.7  bootstrap 95% CI [   +12.7,    +53.1]
+  CBBA single              configs 59  mean    +18.7  bootstrap 95% CI [    -0.9,    +41.6]
+  CBBA capability bundle   configs 59  mean    +82.2  bootstrap 95% CI [   +54.7,   +110.3]
+  CBBA bundle              configs 58  mean   +176.3  bootstrap 95% CI [  +140.6,   +213.5]
+  MARL                     configs 59  mean   +449.7  bootstrap 95% CI [  +410.4,   +489.2]
+  Naive                    configs 59  mean   +815.5  bootstrap 95% CI [  +779.6,   +850.5]
+  Auction                  configs 58  mean   +411.9  bootstrap 95% CI [  +330.8,   +497.2]
+
+=== energy: baseline minus SPPDEC, matched complete-case ===
+  Centralised              configs 59  mean     +4.5  bootstrap 95% CI [    -0.3,     +9.0]
+  CBBA single              configs 59  mean    -18.2  bootstrap 95% CI [   -23.2,    -13.4]
+  CBBA capability bundle   configs 59  mean    -19.7  bootstrap 95% CI [   -24.7,    -14.8]
+  CBBA bundle              configs 58  mean    -20.1  bootstrap 95% CI [   -25.6,    -15.0]
+  MARL                     configs 59  mean    +60.1  bootstrap 95% CI [   +49.3,    +71.7]
+  Naive                    configs 59  mean   +108.0  bootstrap 95% CI [   +91.6,   +124.5]
+  Auction                  configs 58  mean     +4.0  bootstrap 95% CI [    -3.1,    +11.4]

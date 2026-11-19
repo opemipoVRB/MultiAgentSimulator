@@ -1,14 +1,16 @@
 # src/artifacts.py
 import heapq
 import math
+import os
 import random
 import time
+import hashlib
 import uuid
 import pygame
 import requests
 from collections import defaultdict
 from typing import List, Tuple, Optional, Iterable, Dict
-from src.config import OLLAMA_MODELS_DIR, OLLAMA_MODEL, OLLAMA_MODE
+from src.config import OLLAMA_MODELS_DIR, OLLAMA_MODEL, OLLAMA_MODE, SLM_NUM_CTX
 from src.resources import PowerResource, NetworkResource
 import threading
 from collections import deque
@@ -83,6 +85,15 @@ class Drone:
 
         # resources (PowerResource and NetworkResource must exist in file)
         self.power = PowerResource(capacity=battery_capacity)
+        # Consumption-rate multiplier for heterogeneous fleets (1.0 = the nominal model).
+        self.energy_rate = 1.0
+        # Flight speed relative to the nominal speed (1.0 = sim_clock.DRONE_SPEED_PX_S) for heterogeneous fleets; energy per cell does not depend on it.
+        self.speed_scale = 1.0
+        # How strongly carried weight raises consumption on this drone (the nominal model is WEIGHT_FACTOR).
+        self.weight_factor = self.WEIGHT_FACTOR
+        # Hardware reserve: energy the drone's pack is not meant to be drained below. A drone profile setting, the same
+        # for every strategy; it is not enforced (nothing stops the drone) but defines what counts as usable energy.
+        self.reserve_floor = 3.0
         self.network = NetworkResource(
             capacity=100,
             range_cells=1000,
@@ -202,12 +213,6 @@ class Drone:
         self.target = None
         self.moving = False
 
-    def current_target_cell(self) -> Optional[Tuple[int, int]]:
-        """Return the next planned cell (adjacent step) if any."""
-        if 0 <= self._path_step_idx < len(self.path):
-            return self.path[self._path_step_idx]
-        return None
-
     def set_target_cell(self, col: int, row: int):
         """
         Compute a planned route and begin moving.
@@ -229,6 +234,19 @@ class Drone:
         start = (int(self.col), int(self.row))
         goal = (col, row)
         carry_weight = self.carrying.weight if self.carrying else 0.0
+
+        # Map with no-fly blocks (revision): fly the route the planners priced (straight when clear, else around the blocks)
+        from src import obstacles
+        if obstacles.active():
+            here = (int(self.pos.x // self.grid_size), int(self.pos.y // self.grid_size))
+            _, way = obstacles.route(here, goal)
+            if way:
+                self.path = list(way)
+                self._path_step_idx = 0
+                self.target = pygame.Vector2(self.path[0][0] * self.grid_size + self.grid_size / 2,
+                                             self.path[0][1] * self.grid_size + self.grid_size / 2)
+                self.moving = True
+                return
 
         # Prefer direct straight-line move if enabled (smooth diagonal)
         if self.allow_direct:
@@ -321,6 +339,37 @@ class Drone:
         else:
             self.anim_frame = 0
 
+    def consume_hover(self, ratio: float, dt: float, speed_px_s: float):
+        """
+        Energy a drone that is in the air but not moving draws for one step: `ratio` times the power of flying empty at the nominal speed
+        (BASE_COST_PER_CELL per cell at `speed_px_s`), times the same payload factor as flight. A multirotor holds itself up with its rotors, so
+        waiting in the air is not free. `ratio` 0 (the default of the runner) reproduces the earlier model, in which waiting cost nothing.
+        """
+        if ratio <= 0.0 or self.lost:
+            return 0.0
+        carrying_weight = self.carrying.weight if self.carrying else 0.0
+        cost = float(ratio) * self.energy_needed_for_cells(speed_px_s * dt / float(self.grid_size), carrying_weight)
+        self.power.consume(cost)
+        self.hover_energy_used = getattr(self, "hover_energy_used", 0.0) + cost
+        if self.power.is_depleted():
+            self.lost = True
+            self.moving = False
+            self.target = None
+        return cost
+
+    def hover_here(self):
+        """
+        A stop: the drone stays exactly where it is and commits the cell its position lies in (no snap to the cell centre, so a stop moves the drone by nothing).
+        Its committed cell and the terrain occupancy then agree with its position.
+        """
+        self.col = int(self.pos.x // self.grid_size)
+        self.row = int(self.pos.y // self.grid_size)
+        self.last_cell = (self.col, self.row)
+        self.target = None
+        self.moving = False
+        self.terrain.clear_agent_cell(self)
+        self.terrain.register_agent_cell(self, self.col, self.row)
+
     def arrive(self):
         """
         Commit movement by snapping the drone to a grid cell and updating
@@ -374,8 +423,6 @@ class Drone:
             else:
                 self.clear_path()
 
-        if self.controller:
-            self.controller.invalidate_decision(reason="arrived")
 
     # -------------------------
     # Pick / Drop (energy aware)
@@ -408,8 +455,6 @@ class Drone:
         self.carrying = parcel
         self.last_action = ("pick", (self.col, self.row), parcel)
 
-        if self.controller:
-            self.controller.invalidate_decision(reason="picked")
         return True
 
     def perform_drop(self, parcel: 'Parcel') -> bool:
@@ -461,8 +506,6 @@ class Drone:
         if self.power.is_depleted():
             self.lost = True
 
-        if self.controller:
-            self.controller.invalidate_decision(reason="dropped")
         return True
 
     # -------------------------
@@ -501,10 +544,10 @@ class Drone:
 
     def energy_needed_for_cells(self, n_cells: float, weight: float = 0.0) -> float:
         """Energy to travel `n_cells` cells while carrying `weight`."""
-        return float(n_cells) * self.BASE_COST_PER_CELL * (1.0 + weight * self.WEIGHT_FACTOR)
+        return self.energy_rate * float(n_cells) * self.BASE_COST_PER_CELL * (1.0 + weight * self.weight_factor)
 
     def energy_needed_for_pick_drop(self, weight: float = 0.0) -> float:
-        return float(self.PICK_DROP_COST) * (1.0 + weight * self.WEIGHT_FACTOR)
+        return self.energy_rate * float(self.PICK_DROP_COST) * (1.0 + weight * self.weight_factor)
 
     def can_reach_and_return(self, target_col: int, target_row: int, home_col: int, home_row: int) -> bool:
         """
@@ -777,7 +820,8 @@ class Drone:
         self.ollama_port = None
         self.slm_enabled = False
 
-    def slm_generate(self, prompt: str, timeout: int = 60, retries: int = 2) -> str:
+    def slm_generate(self, prompt: str, timeout: int = 60, retries: int = 2, output_schema=None, num_predict: int = 256,
+                     think: bool = False) -> str:
         if not self.slm_enabled or not self.slm_base_url:
             raise RuntimeError(f"SLM not active for drone {self.agent_id}")
 
@@ -796,7 +840,13 @@ class Drone:
             "model": self.slm_model,
             "prompt": prompt,
             "stream": False,  # CRITICAL
+            # think: the model reasons before it answers (a hybrid model such as qwen3:8b); the answer is then free text, because
+            # constrained decoding would suppress the reasoning
+            **({"think": True} if think else {}),
+            **({"format": output_schema} if output_schema and not think else {}),  # constrained decoding (JSON schema)
             "options": {
+                "num_ctx": SLM_NUM_CTX,  # the prompt and the reply must fit (see src/config.py)
+                "num_predict": int(num_predict),  # bound the reply; the arbitration answer needs ~120 tokens
                 "temperature": 0.0,
                 "top_p": 0.1,
             },
@@ -834,6 +884,9 @@ class Drone:
                 if not isinstance(text, str) or not text.strip():
                     raise RuntimeError(f"Bad response: {text}")
 
+                self.slm_last_usage = {"prompt_tokens": data.get("prompt_eval_count"), "gen_tokens": data.get("eval_count")}
+                if (data.get("prompt_eval_count") or 0) + (data.get("eval_count") or 0) >= SLM_NUM_CTX - 16:
+                    raise RuntimeError(f"context window ({SLM_NUM_CTX} tokens) full: the prompt may have been cut")
                 return text.strip()
 
             except Exception as e:
@@ -858,6 +911,17 @@ class Drone:
         else:
             self.messages_failed += 1
 
+        return success
+
+    def broadcast_message(self, receivers, payload, current_step: int) -> bool:
+        """One radio transmission heard by every receiver in range."""
+        success, _ = self.network.send_broadcast(self, receivers, payload, current_step)
+        if success:
+            self.messages_sent += 1
+            self.sent_history.append(current_step)
+            self.network_active = True
+        else:
+            self.messages_failed += 1
         return success
 
     def process_network(self, current_step: int):
@@ -915,8 +979,9 @@ class Parcel:
         self.picked = False
         self.delivered = False
         self.weight = self._sample_weight()
-        self.id = str(uuid.uuid4())[:8]
-
+        # Deterministic id (cell and weight): ids appear in strategy logs and model prompts, so a run must give the same
+        # ids every time; they only need to be unique within a run (the terrain makes them so).
+        self.id = hashlib.sha1(f"{self.col},{self.row},{self.weight!r}".encode()).hexdigest()[:8]
     # -------------------------
     # Physical presence helpers
     # -------------------------
@@ -1038,9 +1103,6 @@ class DeliveryStation:
         self.parked_drones[drone.agent_id] = free
         return free
 
-    def unpark_drone(self, drone):
-        self.parked_drones.pop(drone.agent_id, None)
-
     def register_delivery(self, cell: Tuple[int, int]):
         """Record a delivery into a cell inside the station. Caller should ensure the cell belongs to the station."""
         self.usage[(int(cell[0]), int(cell[1]))] += 1
@@ -1129,20 +1191,14 @@ class Terrain:
             w = random.uniform(0.5, 2.0)
             self.add_parcel(c, r)
 
-    def has_undelivered_parcels(self) -> bool:
-        """
-        Return True if there exists at least one parcel
-        that is not yet delivered and not currently picked.
-        """
-        for p in self.parcels:
-            if not p.delivered and not p.picked:
-                return True
-        return False
-
     def add_parcel(self, col: int, row: int):
         # only add if no parcel at cell at all (including delivered), and not inside station
         if self.parcel_at_cell(col, row, include_delivered=True) is None and not self.is_station_cell(col, row):
-            self.parcels.append(Parcel(col, row, self.grid_size))
+            parcel = Parcel(col, row, self.grid_size)
+            taken = {q.id for q in self.parcels}
+            while parcel.id in taken:   # two parcels with the same cell and weight: derive a distinct id
+                parcel.id = hashlib.sha1((parcel.id + "+").encode()).hexdigest()[:8]
+            self.parcels.append(parcel)
 
     def parcel_at_cell(self, col: int, row: int, include_delivered: bool = False) -> Optional[Parcel]:
         """
@@ -1162,12 +1218,6 @@ class Terrain:
 
     def clear_agent_cell(self, drone):
         self.agent_cells.pop(drone.agent_id, None)
-
-    def agent_at_cell(self, col: int, row: int) -> bool:
-        for _, (c, r) in self.agent_cells.items():
-            if c == col and r == row:
-                return True
-        return False
 
     def occupied_cell(self, col: int, row: int) -> bool:
         """
@@ -1406,11 +1456,6 @@ class CommandCenter:
         self.agents[drone.agent_id] = drone
         print(f"[CC][REGISTER] agent_id={drone.agent_id}")
 
-    def unregister_agent(self, drone):
-        """Unregister a drone"""
-        self.agents.pop(drone.agent_id, None)
-        print(f"[CC][UNREGISTER] agent_id={drone.agent_id}")
-
     # =====================================================
     # Snapshot
     # =====================================================
@@ -1494,7 +1539,7 @@ class CommandCenter:
                 agent_obj = self.agents.get(aid)
                 if agent_obj:
                     snapshot = self.snapshot()
-                    decision = self.strategy.decide(snapshot, aid)
+                    decision = self._decide_timed(snapshot, aid)
 
                     if decision.get("mode") == "plan":
                         success, reason = self.network.send(
@@ -1537,6 +1582,59 @@ class CommandCenter:
         """Resolve an agent_id to a registered Drone instance"""
         return self.agents.get(agent_id)
 
+    def on_message(self, payload, sender=None):
+        """A radio message from a drone reaches the ground station."""
+        self.messages_received += 1
+        kind = payload.get("type") if isinstance(payload, dict) else None
+        aid = getattr(sender, "agent_id", None)
+        if aid is None:
+            return
+        if kind == "request":
+            decision = self.request_directive(aid)
+            # the end of the mission (or a depleted or infeasible station) is also told to the drone over the radio
+            if decision.get("mode") == "idle":
+                step = self.physics.current_step if hasattr(self.physics, "current_step") else 0
+                agent = self._get_agent(aid)
+                if agent is not None:
+                    self.network.send(sender=self, receiver=agent, payload=decision, current_step=step)
+        elif kind == "completed":
+            self.report_completion(aid)
+
+    def report_completion(self, agent_id: str) -> None:
+        """
+        A drone reports that it has delivered its parcel: the ledger records the task as completed and the directive
+        lock on that drone is cleared so it can be given the next task at once.
+        """
+        record = self.strategy.agents.get(agent_id)
+        if record and record["state"] == "executing":
+            parcel_id = record["task"]
+            self.strategy.report_task_completed(agent_id, parcel_id)
+            self._directive_in_flight.discard(agent_id)
+            print(f"[CENTRAL][COMPLETE] agent={agent_id} task={parcel_id}")
+            return parcel_id
+        return None
+
+    def _decide_timed(self, snapshot, agent_id):
+        """strategy.decide, with the CPU time of the planner added up when the environment names a log file (DRONE_CPU_LOG; a measurement only, nothing else changes)."""
+        log = os.environ.get("DRONE_CPU_LOG")
+        if not log:
+            return self.strategy.decide(snapshot, agent_id)
+        if not hasattr(self, "_plan_cpu"):
+            self._plan_cpu, self._plan_calls = 0.0, 0
+            import atexit
+            atexit.register(self._write_plan_cpu, log)
+        t0 = time.process_time()
+        try:
+            return self.strategy.decide(snapshot, agent_id)
+        finally:
+            self._plan_cpu += time.process_time() - t0
+            self._plan_calls += 1
+
+    def _write_plan_cpu(self, log):
+        import json
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"agent": "command_center", "strategy": type(self.strategy).__name__, "think_cpu_s": self._plan_cpu, "calls": self._plan_calls}) + "\n")
+
     def request_directive(self, agent_id: str) -> dict:
         """
         Handle a directive request from an agent.
@@ -1571,7 +1669,7 @@ class CommandCenter:
             return {"mode": "idle"}
 
         snapshot = self.snapshot()
-        decision = self.strategy.decide(snapshot, agent_id)
+        decision = self._decide_timed(snapshot, agent_id)
 
         if decision.get("mode") == "abort":
             print(f"[CC][ABORT] Global infeasibility detected. Signaling abort.")
@@ -1643,17 +1741,6 @@ class CommandCenter:
         recent = [t for t in self.sent_history if now - t <= window]
         return len(recent) / window if window > 0 else 0
 
-    def get_stats(self):
-        """Get statistics for display"""
-        return {
-            "position": (self.col, self.row),
-            "power": f"{self.power.percent():.1f}%",
-            "agents_registered": len(self.agents),
-            "messages_sent": self.messages_sent,
-            "messages_received": self.messages_received,
-            "recent_rate": f"{self.recent_message_rate():.2f}/s",
-        }
-
     # =====================================================
     # Terrain integration methods
     # =====================================================
@@ -1661,10 +1748,6 @@ class CommandCenter:
     def get_position(self):
         """Get grid position for terrain integration"""
         return (self.col, self.row)
-
-    def get_world_position(self):
-        """Get world coordinates"""
-        return (self.pos.x, self.pos.y)
 
     def get_rect(self):
         """Get bounding rectangle for collision detection"""
@@ -1674,9 +1757,3 @@ class CommandCenter:
             self.grid_size,
             self.grid_size
         )
-
-    def get_network_range(self):
-        """Get network range in pixels"""
-        if hasattr(self.network, 'channel') and hasattr(self.network.channel, 'range_cells'):
-            return self.network.channel.range_cells * self.grid_size
-        return 12 * self.grid_size

@@ -1,0 +1,105 @@
+64 configs, 320 instances, strategies: ['cbba_full_capability_bundle', 'cbba_full_cbba_bundle', 'cbba_single_task_cbba_single', 'centralized_cc_hungarian_hungarian', 'consensus_rule_nogamble_limited', 'decentralized_auction_auction_baseline', 'marl_ippo_limited', 'naive_decentralized_reactive']
+
+completion (instances in which every parcel was delivered, of 320 )
+  SPPDEC       289
+  Centralised  288
+  CBBA single  288
+  CBBA bundle  287
+  Auction      282
+  Naive        288
+  CBBA capability bundle 287
+  MARL         288
+
+=== LAST DELIVERY (primary): baseline minus SPPDEC (positive = SPPDEC lower), matched complete-case ===
+  Centralised  mean over 59 configs   +50.0 +/-  18.6 | SPPDEC lower in 51/59 configs | n instances 288 | p(t) 2.1e-06  Holm 2.1e-06 | Wilcoxon 6.4e-08 | instance-level p 1.6e-17
+  CBBA single  mean over 59 configs   +62.0 +/-  18.8 | SPPDEC lower in 54/59 configs | n instances 288 | p(t) 2.2e-08  Holm 4.5e-08 | Wilcoxon 2e-10 | instance-level p 2.3e-25
+  CBBA bundle  mean over 58 configs  +220.4 +/-  36.0 | SPPDEC lower in 58/58 configs | n instances 287 | p(t) 3e-17  Holm 1.5e-16 | Wilcoxon 3.5e-11 | instance-level p 7.6e-63
+  Auction      mean over 58 configs  +456.2 +/-  84.4 | SPPDEC lower in 58/58 configs | n instances 282 | p(t) 4.4e-15  Holm 1.8e-14 | Wilcoxon 3.5e-11 | instance-level p 1.3e-47
+  Naive        mean over 59 configs  +307.3 +/-  30.3 | SPPDEC lower in 59/59 configs | n instances 288 | p(t) 1.4e-27  Holm 9.9e-27 | Wilcoxon 2.4e-11 | instance-level p 1.1e-90
+  CBBA capability bundle mean over 59 configs  +125.6 +/-  26.3 | SPPDEC lower in 58/59 configs | n instances 287 | p(t) 3.3e-13  Holm 1e-12 | Wilcoxon 4e-11 | instance-level p 1.2e-43
+  MARL         mean over 59 configs  +184.6 +/-  29.5 | SPPDEC lower in 58/59 configs | n instances 288 | p(t) 9.4e-18  Holm 5.6e-17 | Wilcoxon 2.5e-11 | instance-level p 3e-58
+
+=== MAKESPAN: baseline minus SPPDEC (positive = SPPDEC lower), matched complete-case ===
+  Centralised  mean over 59 configs   +31.7 +/-  20.2 | SPPDEC lower in 31/59 configs | n instances 288 | p(t) 0.0032  Holm 0.0063 | Wilcoxon 0.052 | instance-level p 2.1e-06
+  CBBA single  mean over 59 configs   +18.7 +/-  21.3 | SPPDEC lower in 25/59 configs | n instances 288 | p(t) 0.089  Holm 0.089 | Wilcoxon 0.67 | instance-level p 0.031
+  CBBA bundle  mean over 58 configs  +176.3 +/-  36.7 | SPPDEC lower in 50/58 configs | n instances 287 | p(t) 3.3e-13  Holm 1.3e-12 | Wilcoxon 7e-10 | instance-level p 1.3e-45
+  Auction      mean over 58 configs  +411.9 +/-  83.5 | SPPDEC lower in 56/58 configs | n instances 282 | p(t) 1.3e-13  Holm 6.5e-13 | Wilcoxon 5.1e-11 | instance-level p 3.7e-41
+  Naive        mean over 59 configs  +815.5 +/-  35.7 | SPPDEC lower in 59/59 configs | n instances 288 | p(t) 1.2e-46  Holm 8.4e-46 | Wilcoxon 2.4e-11 | instance-level p 9.7e-182
+  CBBA capability bundle mean over 59 configs   +82.2 +/-  28.1 | SPPDEC lower in 41/59 configs | n instances 287 | p(t) 3.7e-07  Holm 1.1e-06 | Wilcoxon 3.3e-06 | instance-level p 5.7e-20
+  MARL         mean over 59 configs  +449.7 +/-  40.3 | SPPDEC lower in 59/59 configs | n instances 288 | p(t) 1.1e-29  Holm 6.5e-29 | Wilcoxon 2.4e-11 | instance-level p 1.4e-110
+
+=== FLEET ENERGY: baseline minus SPPDEC (positive = SPPDEC lower), matched complete-case ===
+  Centralised  mean over 59 configs    +4.5 +/-   4.7 | SPPDEC lower in 45/59 configs | n instances 288 | p(t) 0.064  Holm 0.13 | Wilcoxon 0.0059 | instance-level p 0.00049
+  CBBA single  mean over 59 configs   -18.2 +/-   5.0 | SPPDEC lower in 11/59 configs | n instances 288 | p(t) 1.7e-09  Holm 5.1e-09 | Wilcoxon 3.3e-08 | instance-level p 5.9e-41
+  CBBA bundle  mean over 58 configs   -20.1 +/-   5.2 | SPPDEC lower in 8/58 configs | n instances 287 | p(t) 4.1e-10  Holm 1.7e-09 | Wilcoxon 1.5e-08 | instance-level p 1.2e-43
+  Auction      mean over 58 configs    +4.0 +/-   7.5 | SPPDEC lower in 32/58 configs | n instances 282 | p(t) 0.3  Holm 0.3 | Wilcoxon 0.43 | instance-level p 0.16
+  Naive        mean over 59 configs  +108.0 +/-  16.7 | SPPDEC lower in 59/59 configs | n instances 288 | p(t) 2.4e-18  Holm 1.7e-17 | Wilcoxon 2.4e-11 | instance-level p 2.3e-82
+  CBBA capability bundle mean over 59 configs   -19.7 +/-   5.0 | SPPDEC lower in 9/59 configs | n instances 287 | p(t) 1.5e-10  Holm 7.7e-10 | Wilcoxon 6.8e-09 | instance-level p 5.5e-46
+  MARL         mean over 59 configs   +60.3 +/-  11.3 | SPPDEC lower in 59/59 configs | n instances 288 | p(t) 6.1e-15  Holm 3.7e-14 | Wilcoxon 2.4e-11 | instance-level p 4.5e-62
+
+=== by load regime (agents per parcel), last delivery: baseline minus SPPDEC, mean over configs in the regime ===
+  low (<=0.25)       16 configs | Centralised +167.3 (11/11) | CBBA single +179.6 (11/11) | CBBA bundle +382.0 (10/10) | Auction +317.7 (10/10) | Naive +338.0 (11/11) | CBBA capability bundle +268.8 (11/11) | MARL +176.4 (11/11)
+  middle (0.25-0.6)  23 configs | Centralised  +38.5 (19/23) | CBBA single  +49.3 (20/23) | CBBA bundle +209.9 (23/23) | Auction +601.2 (23/23) | Naive +329.8 (23/23) | CBBA capability bundle +129.1 (22/23) | MARL +226.5 (22/23)
+  high (>0.6)        25 configs | Centralised   +8.9 (21/25) | CBBA single  +22.1 (23/25) | CBBA bundle +165.6 (25/25) | Auction +378.1 (25/25) | Naive +273.2 (25/25) | CBBA capability bundle  +59.3 (25/25) | MARL +149.6 (25/25)
+
+=== per config: mean last delivery (SPPDEC | best baseline | its name), instances in which SPPDEC was not faster than the best baseline ===
+  A2_P4    n=5    477 |    450 | CBBA capability bundle | SPPDEC not fastest in 4/5
+  A2_P6    n=5    602 |    628 | MARL         | SPPDEC not fastest in 2/5
+  A2_P8    n=5    785 |    853 | MARL         | SPPDEC not fastest in 2/5
+  A2_P12   n=5   1081 |   1136 | MARL         | SPPDEC not fastest in 1/5
+  A2_P14   n=5   1397 |   1589 | Auction      | SPPDEC not fastest in 0/5
+  A4_P4    n=5    289 |    287 | Centralised  | SPPDEC not fastest in 4/5
+  A4_P10   n=5    594 |    648 | CBBA single  | SPPDEC not fastest in 2/5
+  A4_P12   n=5    711 |    751 | CBBA bundle  | SPPDEC not fastest in 2/5
+  A4_P24   n=5   1231 |   1387 | MARL         | SPPDEC not fastest in 1/5
+  A4_P36   n=1   1664 |   1832 | Auction      | SPPDEC not fastest in 0/1
+  A6_P4    n=5    259 |    265 | Centralised  | SPPDEC not fastest in 0/5
+  A6_P8    n=5    454 |    458 | Centralised  | SPPDEC not fastest in 3/5
+  A6_P12   n=5    503 |    553 | CBBA capability bundle | SPPDEC not fastest in 2/5
+  A6_P14   n=5    672 |    690 | CBBA single  | SPPDEC not fastest in 3/5
+  A6_P20   n=5    893 |    875 | Centralised  | SPPDEC not fastest in 3/5
+  A6_P24   n=5    892 |   1016 | Centralised  | SPPDEC not fastest in 0/5
+  A6_P26   n=5   1062 |   1141 | CBBA single  | SPPDEC not fastest in 1/5
+  A6_P30   n=5   1118 |   1234 | Centralised  | SPPDEC not fastest in 0/5
+  A6_P36   n=5   1303 |   1414 | Centralised  | SPPDEC not fastest in 1/5
+  A8_P4    n=5    276 |    282 | Centralised  | SPPDEC not fastest in 0/5
+  A8_P12   n=5    448 |    478 | Centralised  | SPPDEC not fastest in 2/5
+  A8_P18   n=5    613 |    605 | Centralised  | SPPDEC not fastest in 2/5
+  A8_P24   n=5    798 |    810 | Centralised  | SPPDEC not fastest in 2/5
+  A8_P36   n=4   1048 |   1095 | Centralised  | SPPDEC not fastest in 1/4
+  A10_P4   n=5    266 |    273 | Centralised  | SPPDEC not fastest in 0/5
+  A10_P8   n=5    305 |    320 | Centralised  | SPPDEC not fastest in 0/5
+  A10_P12  n=5    419 |    409 | Centralised  | SPPDEC not fastest in 3/5
+  A10_P14  n=5    445 |    447 | Centralised  | SPPDEC not fastest in 2/5
+  A10_P20  n=5    541 |    548 | Centralised  | SPPDEC not fastest in 3/5
+  A10_P22  n=5    563 |    630 | Centralised  | SPPDEC not fastest in 0/5
+  A10_P24  n=5    696 |    673 | Centralised  | SPPDEC not fastest in 3/5
+  A10_P26  n=5    603 |    679 | CBBA single  | SPPDEC not fastest in 0/5
+  A10_P30  n=5    740 |    818 | Centralised  | SPPDEC not fastest in 0/5
+  A10_P36  n=3    884 |    954 | Centralised  | SPPDEC not fastest in 1/3
+  A12_P4   n=5    282 |    296 | Centralised  | SPPDEC not fastest in 0/5
+  A12_P12  n=5    331 |    344 | Centralised  | SPPDEC not fastest in 0/5
+  A12_P24  n=5    569 |    603 | CBBA single  | SPPDEC not fastest in 2/5
+  A12_P26  n=5    623 |    615 | Centralised  | SPPDEC not fastest in 3/5
+  A12_P36  n=3    832 |    909 | Centralised  | SPPDEC not fastest in 0/3
+  A15_P4   n=5    252 |    258 | Centralised  | SPPDEC not fastest in 0/5
+  A15_P8   n=5    308 |    323 | Centralised  | SPPDEC not fastest in 0/5
+  A15_P12  n=5    280 |    295 | Centralised  | SPPDEC not fastest in 0/5
+  A15_P14  n=5    334 |    351 | Centralised  | SPPDEC not fastest in 0/5
+  A15_P20  n=5    474 |    450 | Centralised  | SPPDEC not fastest in 3/5
+  A15_P24  n=5    466 |    512 | CBBA single  | SPPDEC not fastest in 2/5
+  A15_P26  n=5    534 |    535 | Centralised  | SPPDEC not fastest in 3/5
+  A15_P30  n=5    570 |    624 | Centralised  | SPPDEC not fastest in 2/5
+  A15_P36  n=5    718 |    728 | Centralised  | SPPDEC not fastest in 2/5
+  A18_P36  n=5    563 |    662 | Centralised  | SPPDEC not fastest in 1/5
+  A20_P4   n=5    240 |    248 | Centralised  | SPPDEC not fastest in 0/5
+  A20_P8   n=5    291 |    297 | Centralised  | SPPDEC not fastest in 0/5
+  A20_P12  n=5    291 |    307 | Centralised  | SPPDEC not fastest in 0/5
+  A20_P14  n=5    307 |    327 | Centralised  | SPPDEC not fastest in 0/5
+  A20_P20  n=5    332 |    352 | Centralised  | SPPDEC not fastest in 0/5
+  A20_P24  n=5    489 |    450 | Centralised  | SPPDEC not fastest in 3/5
+  A20_P26  n=5    451 |    462 | Centralised  | SPPDEC not fastest in 2/5
+  A20_P30  n=5    504 |    519 | Centralised  | SPPDEC not fastest in 2/5
+  A20_P36  n=5    592 |    598 | Centralised  | SPPDEC not fastest in 3/5
+
+configs in which SPPDEC's mean last delivery is above the best baseline's: ['A2_P4', 'A4_P4', 'A6_P20', 'A8_P18', 'A10_P12', 'A10_P24', 'A12_P26', 'A15_P20', 'A20_P24']

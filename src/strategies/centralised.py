@@ -1,8 +1,8 @@
 from typing import Dict, List, Optional, Tuple
-import time
 from artifacts import Drone, Parcel
 from strategies.base import BaseStrategy
 from src.system.abort import AbortReason
+from src import sim_clock
 
 
 class CentralisedStrategy(BaseStrategy):
@@ -48,7 +48,7 @@ class CentralisedStrategy(BaseStrategy):
         self._abort_emitted = False
         self.mission_complete = False
 
-        self.last_progress_time = time.time()
+        self.last_progress_time = sim_clock.now()
         self.task_assignment_times = {}  # task_id -> timestamp
 
         print(f"[CENTRAL][INIT] Assignment mode: {self.assignment_mode}")
@@ -62,7 +62,7 @@ class CentralisedStrategy(BaseStrategy):
         Perform one authoritative coordination cycle.
         """
         if now is None:
-            now = time.time()
+            now = sim_clock.now()
 
         self.terrain = terrain
 
@@ -171,7 +171,7 @@ class CentralisedStrategy(BaseStrategy):
                 self.agents[d.agent_id] = {
                     "state": "idle",
                     "task": None,
-                    "last_seen": time.time(),
+                    "last_seen": sim_clock.now(),
                 }
 
             if d.power.level <= 0:
@@ -188,7 +188,7 @@ class CentralisedStrategy(BaseStrategy):
 
             if p.delivered:
                 if self.tasks[p.id]["state"] != "completed":
-                    self.last_progress_time = time.time()
+                    self.last_progress_time = sim_clock.now()
                 self.tasks[p.id]["state"] = "completed"
 
     # ============================================================
@@ -298,7 +298,7 @@ class CentralisedStrategy(BaseStrategy):
                 assignments.append((chosen, task["parcel_id"]))
                 idle_agents.remove(chosen)  # Already does this, but task is assigned AFTER loop
 
-        self.last_progress_time = time.time()
+        self.last_progress_time = sim_clock.now()
 
         # 🔥 CRITICAL: Mark tasks as assigned BEFORE updating agent records
         # This prevents double-assignment if _assign_tasks runs again before messages are sent
@@ -401,16 +401,19 @@ class CentralisedStrategy(BaseStrategy):
 
                 if self._agent_can_complete(drone, parcel, station):
                     # Compute energy cost for pickup + delivery
+                    phys = self._physics_for(drone)
                     cost = (
-                            self.physics.energy_cost(
+                            phys.energy_cost(
                                 self.physics.distance((drone.col, drone.row), (parcel.col, parcel.row)),
                                 0.0
                             ) +
-                            self.physics.energy_cost(
+                            phys.energy_cost(
                                 self.physics.distance((parcel.col, parcel.row), station),
                                 parcel.weight
-                            )
+                            ) +
+                            2.0 * phys.pick_drop_cost(parcel.weight)
                     )
+                    cost += self.time_weight * self.trip_time((drone.col, drone.row), (parcel.col, parcel.row), station, speed=getattr(drone, "speed_scale", 1.0))
                     row.append(cost)
                 else:
                     # Infeasible assignment gets penalty cost
@@ -422,7 +425,7 @@ class CentralisedStrategy(BaseStrategy):
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
         # Apply assignments
-        self.last_progress_time = time.time()
+        self.last_progress_time = sim_clock.now()
 
         for agent_idx, task_idx in zip(row_ind, col_ind):
             agent_id = idle_agents[agent_idx]
@@ -475,7 +478,7 @@ class CentralisedStrategy(BaseStrategy):
         if task_id in self.task_assignment_times:
             del self.task_assignment_times[task_id]
 
-        self.last_progress_time = time.time()
+        self.last_progress_time = sim_clock.now()
 
         print(f"[CENTRAL][COMPLETE] agent={agent_id} task={task_id}")
 
@@ -528,9 +531,11 @@ class CentralisedStrategy(BaseStrategy):
                 dist1 = self.physics.distance((drone.col, drone.row), (parcel.col, parcel.row))
                 dist2 = self.physics.distance((parcel.col, parcel.row), station)
 
+                phys = self._physics_for(drone)
                 cost = (
-                        self.physics.energy_cost(dist1, 0.0)
-                        + self.physics.energy_cost(dist2, parcel.weight)
+                        phys.energy_cost(dist1, 0.0)
+                        + phys.energy_cost(dist2, parcel.weight)
+                        + 2.0 * phys.pick_drop_cost(parcel.weight)
                 )
 
                 bids.append((cost, aid, parcel.id))
@@ -557,7 +562,7 @@ class CentralisedStrategy(BaseStrategy):
 
             print(f"[CENTRAL][AUCTION] agent={aid} task={pid} cost={cost:.2f}")
 
-        self.last_progress_time = time.time()
+        self.last_progress_time = sim_clock.now()
 
     # ============================================================
     # Failure detection
@@ -629,23 +634,6 @@ class CentralisedStrategy(BaseStrategy):
                 print(f"    {tid}: state={trec['state']} assigned_to={trec.get('agent')}")
         print()
 
-    def _agent_snapshot_can_complete(self, agent, parcel, station_cell):
-        dist1 = self.physics.distance(
-            (agent["col"], agent["row"]),
-            (parcel["col"], parcel["row"])
-        )
-        dist2 = self.physics.distance(
-            (parcel["col"], parcel["row"]),
-            station_cell
-        )
-
-        cost = (
-                self.physics.energy_cost(dist1, 0.0)
-                + self.physics.energy_cost(dist2, parcel["weight"])
-        )
-
-        return agent["battery"] > cost
-
     def is_globally_feasible(self, snapshot=None):
         return self._globally_feasible_authoritative()
 
@@ -704,7 +692,7 @@ class CentralisedStrategy(BaseStrategy):
             return
 
         # Deadlock only if nothing has progressed for too long
-        elapsed = time.time() - self.last_progress_time
+        elapsed = sim_clock.now() - self.last_progress_time
         if elapsed > 10.0:
             self.debug_state()
             print(f"[CENTRAL][ABORT] Global deadlock: no progress for {elapsed:.1f}s")
@@ -713,6 +701,16 @@ class CentralisedStrategy(BaseStrategy):
     # ============================================================
     # Feasibility
     # ============================================================
+
+    def _physics_for(self, drone):
+        """The energy model of one drone: its declared spec, measured in the pre-mission calibration."""
+        cache = self.__dict__.setdefault("_declared_physics", {})
+        if drone.agent_id not in cache:
+            from src.calibration import calibrate
+            from src.energy import DeclaredPhysics
+            cal = calibrate(drone)
+            cache[drone.agent_id] = DeclaredPhysics(self.physics, cal["unloaded_per_cell"], cal["weight_sensitivity"])
+        return cache[drone.agent_id]
 
     def _agent_can_complete(self, agent: Drone, parcel: Parcel, station: Tuple[int, int]):
         dist_to_parcel = self.physics.distance(
@@ -724,12 +722,14 @@ class CentralisedStrategy(BaseStrategy):
             b=station,
         )
 
+        phys = self._physics_for(agent)
         cost = (
-                self.physics.energy_cost(dist_to_parcel, 0.0)
-                + self.physics.energy_cost(dist_to_station, parcel.weight)
+                phys.energy_cost(dist_to_parcel, 0.0)
+                + phys.energy_cost(dist_to_station, parcel.weight)
+                + 2.0 * phys.pick_drop_cost(parcel.weight)
         )
 
-        return agent.power.level > cost + self.FEASIBILITY_MARGIN
+        return agent.power.level > cost + agent.reserve_floor
 
     # ============================================================
     # Utilities
@@ -740,22 +740,4 @@ class CentralisedStrategy(BaseStrategy):
             return None
         s = self.terrain.stations[0]
         return s.col + s.w // 2, s.row + s.h // 2
-
-    def _best_station_entry_cell(self, parcel: Dict, station: Dict, agent_id: str):
-        # Use the authoritative world model
-        station_obj = self.terrain.get_station_at(
-            station["col"],
-            station["row"]
-        )
-
-        if station_obj is None:
-            return None
-
-        drop = station_obj.least_used_free_cell(
-            terrain=self.terrain,
-            ref_col=parcel["col"],
-            ref_row=parcel["row"],
-        )
-
-        return drop
 

@@ -5,6 +5,10 @@ from collections import deque
 from src.network.models import NetworkChannel, RadioEnergyModel
 
 
+# Energy to receive one message, in units (SiK radio: about 0.7 mJ; 1 unit = 3.6 kJ). See .ignore/revision/simulated_hardware.md.
+RADIO_RX_ENERGY = 1.9e-7
+
+
 # -------------------------
 # Resource classes
 # -------------------------
@@ -119,14 +123,27 @@ class NetworkResource:
         sender_id = getattr(sender, "agent_id", "command_center")
         receiver_id = getattr(receiver, "agent_id", None)
 
-        # 1. Environmental feasibility
-        allowed, reason = self.channel.can_transmit(sender, receiver)
+        # 1. Environmental feasibility (with acknowledged repeats when the profile sets retries > 1)
+        energy_cost = self.energy_model.cost(sender, receiver)
+        attempts = max(1, int(getattr(self.channel, "retries", 1)))
+        waited = 0
+        for attempt in range(attempts):
+            allowed, reason = self.channel.can_transmit(sender, receiver, extra_steps=waited)
+            if allowed or reason in ("capacity", "range"):
+                break
+            if attempts > 1 and attempt < attempts - 1:
+                # a lost attempt still used the transmitter; the sender waits for the missing acknowledgement
+                sp = getattr(sender, "power", None)
+                if sp is not None and sp.level >= energy_cost:
+                    sp.consume(energy_cost)
+                if self.flight_recorder and self.flight_recorder.metrics:
+                    self.flight_recorder.metrics.messages_sent += 1
+                waited += 2 * int(self.channel.delay_range[1])
         if not allowed:
             self._log("send_failed", sender=sender_id, receiver=receiver_id, reason=reason)
             return False, reason
 
-        # 2. Compute energy cost
-        energy_cost = self.energy_model.cost(sender, receiver)
+        # 2. Energy cost (computed above)
 
         # 3. Drain sender battery if it has one
         sender_power = getattr(sender, "power", None)
@@ -140,7 +157,7 @@ class NetworkResource:
 
         # 4. Transmission succeeds physically
         self.channel.register_send()
-        delay = self.channel.sample_delay()
+        delay = self.channel.sample_delay() + waited
         deliver_at = current_step + delay
 
         self.outbox.append((deliver_at, sender, receiver, payload))
@@ -159,6 +176,56 @@ class NetworkResource:
 
         return True, "ok"
 
+    def send_broadcast(self, sender, receivers, payload, current_step: int):
+        """
+        One transmission heard by every receiver in range: one use of the channel and one energy cost (for the farthest
+        receiver in range); each receiver gets or misses it independently, and all share one delay.
+        """
+        sender_id = getattr(sender, "agent_id", "command_center")
+        if self.channel.sent_this_step >= self.channel.bandwidth:
+            self._log("send_failed", sender=sender_id, receiver="*", reason="capacity")
+            return False, "capacity"
+        in_range = [r for r in receivers
+                    if abs(sender.col - r.col) + abs(sender.row - r.row) <= self.channel.range_cells]
+        if not in_range:
+            return False, "range"
+        retries = max(1, int(getattr(self.channel, "retries", 1)))
+        if retries == 1 and self.channel.in_outage():
+            self._log("send_failed", sender=sender_id, receiver="*", reason="outage")
+            return False, "outage"
+        energy_cost = max(self.energy_model.cost(sender, r) for r in in_range)
+        sender_power = getattr(sender, "power", None)
+        if sender_power is not None:
+            if sender_power.level < energy_cost:
+                self._log("send_failed", sender=sender_id, receiver="*", reason="depleted")
+                return False, "depleted"
+            sender_power.consume(energy_cost)
+        self.channel.register_send()
+        delay = self.channel.sample_delay()
+        # each receiver hears the message at the first attempt that gets through (acknowledged repeat, up to `retries` attempts, a wait of twice the longest delay between attempts);
+        # every extra attempt the sender makes costs transmit energy and counts as a message
+        heard, attempts_used = [], 1
+        for r in in_range:
+            p = self.channel.reliability_at(abs(sender.col - r.col) + abs(sender.row - r.row))
+            waited = 0
+            for a in range(retries):
+                if not self.channel.in_outage(waited) and random.random() <= p:
+                    heard.append((r, waited))
+                    attempts_used = max(attempts_used, a + 1)
+                    break
+                waited += 2 * int(self.channel.delay_range[1])
+            else:
+                attempts_used = retries
+        for extra in range(attempts_used - 1):
+            if sender_power is not None and sender_power.level >= energy_cost:
+                sender_power.consume(energy_cost)
+        for r, waited in heard:
+            self.outbox.append((current_step + delay + waited, sender, r, payload))
+        if self.flight_recorder and self.flight_recorder.metrics:
+            self.flight_recorder.metrics.messages_sent += attempts_used
+        self._log("send_enqueued", sender=sender_id, receiver="*", cost=energy_cost, delay=delay, step=current_step)
+        return True, "ok"
+
     # ------------------------------------------------------------
     # Delivery
     # ------------------------------------------------------------
@@ -168,9 +235,15 @@ class NetworkResource:
         """
         delivered = []
 
-        while self.outbox and self.outbox[0][0] <= current_step:
-            _, sender, receiver, payload = self.outbox.popleft()
+        # every message that is due, in the order sent (a slow message does not hold up a later, faster one)
+        due = [m for m in self.outbox if m[0] <= current_step]
+        if due:
+            self.outbox = type(self.outbox)(m for m in self.outbox if m[0] > current_step)
+        for _, sender, receiver, payload in due:
             delivered.append((receiver, payload))
+            rx_power = getattr(receiver, "power", None)
+            if RADIO_RX_ENERGY > 0.0 and rx_power is not None:
+                rx_power.consume(min(RADIO_RX_ENERGY, rx_power.level))      # receiving costs energy too
 
             self._log(
                 "delivered",

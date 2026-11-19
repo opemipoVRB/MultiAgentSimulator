@@ -1,6 +1,8 @@
 # src/system/capacity.py
 import psutil
 
+from src.system.topology import physical_core_groups
+
 
 class AgentCapacityError(RuntimeError):
     pass
@@ -18,7 +20,14 @@ class SystemCapacityChecker:
             cpu_cores_per_agent: int = 1,
             min_free_ram_gb: float = 1.0,
             verbose: bool = True,
+            process_mode: bool = True,
+            reserved_cores: int = 1,
     ):
+        # process_mode: every drone is its own process on its own physical core, so cores limit the fleet; the world
+        # process takes `reserved_cores`. Measured: a drone process is about 0.1 GB (a 12-drone run peaks near 1.2 GB
+        # in total), so the default RAM figure is the embedded-model case; callers with a shared model server pass less.
+        self.process_mode = process_mode
+        self.reserved_cores = reserved_cores
         self.ram_per_agent_gb = ram_per_agent_gb
         self.cpu_cores_per_agent = cpu_cores_per_agent
         self.min_free_ram_gb = min_free_ram_gb
@@ -36,9 +45,10 @@ class SystemCapacityChecker:
         usable_ram = max(0.0, available_gb - self.min_free_ram_gb)
         max_by_ram = int(usable_ram // self.ram_per_agent_gb)
 
-        physical_cores = psutil.cpu_count(logical=False) or 1
+        physical_cores = len(physical_core_groups())          # physical cores this process may use
         logical_cores = psutil.cpu_count(logical=True) or physical_cores
-        max_by_cpu = int(physical_cores // self.cpu_cores_per_agent)
+        max_by_cpu = (max(0, physical_cores - self.reserved_cores) // self.cpu_cores_per_agent
+                      if self.process_mode else 10 ** 6)
 
         # Logging
         self._log(f"Total RAM: {total_gb:.2f} GB")

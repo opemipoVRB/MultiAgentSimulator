@@ -26,7 +26,6 @@ class DecentralizedAuctionStrategy(BaseStrategy):
 
     BID_INTERVAL = 5
     BID_EXPIRY = 20
-    FEASIBILITY_MARGIN = 3.0
 
     def __init__(self, physics=None):
         super().__init__()
@@ -79,10 +78,8 @@ class DecentralizedAuctionStrategy(BaseStrategy):
             "step": step,
         }
 
-        for agent in self.drone.terrain.agents.values():
-            if agent.agent_id != self.agent_id:
-                print(f"[CBBA][{self.agent_id}] SEND bid task={task_id} -> {agent.agent_id}")
-                self.drone.send_message(agent, payload, step)
+        print(f"[CBBA][{self.agent_id}] SEND bid task={task_id} -> all")
+        self.drone.broadcast(payload, step)
 
     def _broadcast_commit(self, task_id: str, step: int):
         payload = {
@@ -92,10 +89,8 @@ class DecentralizedAuctionStrategy(BaseStrategy):
             "step": step,
         }
 
-        for agent in self.drone.terrain.agents.values():
-            if agent.agent_id != self.agent_id:
-                print(f"[CBBA][{self.agent_id}] SEND COMMIT task={task_id} -> {agent.agent_id}")
-                self.drone.send_message(agent, payload, step)
+        print(f"[CBBA][{self.agent_id}] SEND COMMIT task={task_id} -> all")
+        self.drone.broadcast(payload, step)
 
     def _process_messages(self, step: int):
         # Prevent double-processing within same simulation step
@@ -300,19 +295,9 @@ class DecentralizedAuctionStrategy(BaseStrategy):
 
         cur = (agent["col"], agent["row"])
         pick = (parcel["col"], parcel["row"])
-        drop = (
-            station["col"] + station["w"] // 2,
-            station["row"] + station["h"] // 2,
-        )
+        drop = self._bid_drop(pick, station)
 
-        d1 = self.physics.distance(cur, pick)
-        d2 = self.physics.distance(pick, drop)
-
-        cost = (
-                self.physics.energy_cost(d1, 0.0) +
-                self.physics.energy_cost(d2, parcel["weight"]) +
-                2 * self.physics.energy_cost(0.0, parcel["weight"])
-        )
+        cost = self.trip_energy(cur, pick, drop, parcel["weight"])
 
         battery = float(self.drone.power.level)
         feasible = battery >= cost + self.FEASIBILITY_MARGIN
@@ -329,35 +314,4 @@ class DecentralizedAuctionStrategy(BaseStrategy):
         if not feasible:
             return None
 
-        return cost
-
-    def _choose_drop_cell(
-            self,
-            pick: tuple[int, int],
-            station: Optional[Dict[str, Any]],
-    ) -> tuple[int, int]:
-        if not station:
-            return pick
-
-        terrain = self.drone.terrain if hasattr(self.drone, "terrain") else None
-        if terrain is None:
-            return (
-                station["col"] + station["w"] // 2,
-                station["row"] + station["h"] // 2,
-            )
-
-        real_station = terrain.get_station_at(station["col"], station["row"])
-        if real_station is None:
-            return pick
-
-        free = real_station.free_cells(terrain)
-
-        if not free:
-            free = real_station.parking_cells()
-
-        chosen = min(
-            free,
-            key=lambda c: abs(c[0] - pick[0]) + abs(c[1] - pick[1])
-        )
-
-        return chosen
+        return cost + self.time_weight * self.trip_time(cur, pick, drop)       # the bid also prices the trip's time when the arm asks (time_weight > 0)
